@@ -381,6 +381,81 @@ def check_smtp(properties):
     return {'ok': True, 'server': host, 'port': port, 'tls': True, 'authenticated': True, 'sent_messages': 0}
 
 
+def nginx_nodes(text):
+    tokens = [(match.group(), match.start(), match.end()) for match in re.finditer(
+        r'''\#[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[{};]|[^\s{};#]+''', text)
+        if not match.group().startswith('#')]
+    position = 0
+
+    def parse(in_block=False):
+        nonlocal position
+        nodes, header = [], []
+        while position < len(tokens):
+            token = tokens[position]
+            position += 1
+            if token[0] == '}':
+                if header or not in_block:
+                    raise ValueError('Unbalanced nginx configuration')
+                return nodes, token[2]
+            if token[0] in ('{', ';'):
+                if not header:
+                    raise ValueError('Empty nginx directive')
+                children, end = parse(True) if token[0] == '{' else (None, token[2])
+                nodes.append({'header': [item[0] for item in header], 'start': header[0][1], 'end': end, 'children': children})
+                header = []
+            else:
+                header.append(token)
+        if header or in_block:
+            raise ValueError('Unterminated nginx configuration')
+        return nodes, len(text)
+
+    return parse()[0]
+
+
+def safe_condition(header):
+    value = ' '.join(header)
+    match = re.fullmatch(r'''if\s*\(\s*(\$(?:host|http_host|server_name|scheme|https|server_port|uri|request_uri))\s*(=|!=|~\*?|!~\*?)\s*["']?([^"']+?)["']?\s*\)''', value)
+    allowed = {'otcm.app', 'www.otcm.app', 'http', 'https', 'on', 'off', '80', '443',
+               '/api/stripe/webhook', '/api/stripe/webhook/', '^otcm\\.app$', '^otcm.app$', '^www\\.otcm\\.app$'}
+    if match and match[3].strip() in allowed:
+        return {'variable': match[1], 'operator': match[2], 'value': match[3].strip()}
+    return {'condition': '[unrecognized-condition]',
+            'known_variables': sorted(set(re.findall(r'\$(?:host|http_host|server_name|scheme|https|server_port|uri|request_uri)\b', value)))}
+
+
+def nginx_structure(text):
+    returns, proxies = [], []
+
+    def walk(nodes, conditions=None, locations=None):
+        conditions, locations = conditions or [], locations or []
+        for node in nodes:
+            header = node['header']
+            if header[0] == 'return' and len(header) == 3 and header[1] in ('301', '302', '307', '308'):
+                returns.append({'status': int(header[1]), 'target': safe_url(header[2], nginx=True),
+                                'conditions': conditions, 'locations': locations,
+                                'parent_block_scope': 'conditional' if conditions else 'location' if locations else 'server'})
+            if header[0] == 'proxy_pass' and len(header) == 2:
+                try:
+                    target = urllib.parse.urlsplit(header[1])
+                    valid = target.scheme == 'http' and target.hostname in ('127.0.0.1', 'localhost', '::1') and target.port == 8006 and target.path in ('', '/', '/api/', '/api/stripe/webhook', '/api/stripe/webhook/')
+                except ValueError:
+                    valid = False
+                if valid:
+                    proxies.append({'target': 'http://127.0.0.1:8006' + target.path, 'locations': locations, 'conditions': conditions})
+            if node['children'] is not None:
+                next_conditions = conditions + [safe_condition(header)] if header[0] == 'if' else conditions
+                next_locations = locations
+                if header[0] == 'location':
+                    location = header[-1]
+                    if location not in ('/', '/api', '/api/', '/api/stripe/webhook', '/api/stripe/webhook/'):
+                        location = '[location-redacted]'
+                    next_locations = locations + [{'path': location, 'modifier': header[1] if len(header) == 3 and header[1] in ('=', '^~', '~', '~*') else ''}]
+                walk(node['children'], next_conditions, next_locations)
+
+    walk(nginx_nodes(text))
+    return {'return_rules': returns, 'clinic_loopback_proxies': proxies}
+
+
 def check_nginx():
     directory = pathlib.Path('/www/server/panel/vhost/nginx')
     sites = []
@@ -422,7 +497,8 @@ def check_nginx():
         locations = sorted({location for location in re.findall(r'\blocation\s+(?:=\s+|\^~\s+)?([^\s{]+)\s*\{', text)
                             if location in ('/', '/api', '/api/', '/api/stripe/webhook', '/api/stripe/webhook/')})
         sites.append({'domains': domains, 'redirects': redirects, 'rewrites': rewrites, 'api_locations': locations,
-                      'clinic_snippets_loaded': included_count, 'other_includes_not_expanded': unexpanded})
+                      'clinic_snippets_loaded': included_count, 'other_includes_not_expanded': unexpanded,
+                      'structure': nginx_structure(text)})
     return {'ok': bool(sites), 'sites': sites, 'scope': 'two clinic site files and their explicitly named clinic snippets only'}
 
 
@@ -459,6 +535,17 @@ class OfflineTests(unittest.TestCase):
 
     def test_failure_has_no_message(self):
         self.assertEqual(failure(ValueError('sk_live_secret')), {'ok': False, 'error_type': 'ValueError'})
+
+    def test_nginx_condition_and_proxy(self):
+        text = '''server { server_name otcm.app www.otcm.app;
+        if ($host = otcm.app) { return 301 https://www.otcm.app$request_uri; }
+        location /api/ { proxy_pass http://127.0.0.1:8006; }
+        location /private { proxy_pass https://unrelated.example/private-key; }
+        }'''
+        structure = nginx_structure(text)
+        self.assertEqual(structure['return_rules'][0]['conditions'], [{'variable': '$host', 'operator': '=', 'value': 'otcm.app'}])
+        self.assertEqual(structure['clinic_loopback_proxies'], [{'target': 'http://127.0.0.1:8006', 'locations': [{'path': '/api/', 'modifier': ''}], 'conditions': []}])
+        self.assertNotIn('private-key', json.dumps(structure))
 
 
 def main():
