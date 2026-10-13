@@ -149,7 +149,7 @@ token:
   # 令牌密钥
   secret: ${RUOYI_TOKEN_SECRET:replace-this-token-secret-before-production}
   # 令牌有效期（分钟）
-  expireTime: ${RUOYI_TOKEN_EXPIRE_MINUTES:120}
+  expireTime: ${RUOYI_TOKEN_EXPIRE_MINUTES:1440}
 
 file-access:
   base-url: ${FILE_ACCESS_BASE_URL:}

@@ -19,6 +19,7 @@ import org.springframework.transaction.annotation.Transactional;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONArray;
 import com.alibaba.fastjson2.JSONObject;
+import com.ruoyi.hospital.utils.PayloadUtils;
 import com.ruoyi.common.exception.ServiceException;
 import com.ruoyi.common.utils.DateUtils;
 import com.ruoyi.common.utils.StringUtils;
@@ -108,6 +109,7 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
      * @return 影响行数
      */
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public int insertTcmConsultation(TcmConsultation consultation)
     {
         if (consultation.getId() == null || consultation.getId().isEmpty())
@@ -121,9 +123,12 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         consultation.setVersion(1);
         consultation.setCreateTime(DateUtils.getNowDate());
         JSONObject payload = normalizeConsultationPayload(consultation, parsePayload(consultation.getPayload()));
+        inheritPrescriptionInventoryState(payload, new JSONObject());
+        rebuildReservationsForPayload(payload);
         consultation.setPayload(payload.toJSONString());
         HistorySourceContext historyContext = normalizeHistorySnapshot(consultation, null);
         int rows = consultationMapper.insertTcmConsultation(consultation);
+        if (rows != 1) throw new ServiceException("问诊保存失败，库存变动已取消");
         syncConsultationFiles(consultation, payload);
         if (historyContext.isSourceConsultation())
         {
@@ -150,6 +155,10 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
             throw new ServiceException("问诊记录不存在");
         }
         consultation.setId(existing.getId());
+        if (StringUtils.isNotEmpty(existing.getDeletedAt()))
+        {
+            throw new ServiceException("问诊记录已删除，请先恢复后再保存");
+        }
         if (isConsultationLocked(existing))
         {
             throw new ServiceException("该问诊已完成并锁定，请先 Reactivate 后再修改");
@@ -157,6 +166,7 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         consultation.setStatus(resolvePersistedStatus(existing.getStatus(), consultation.getStatus()));
         JSONObject existingPayload = normalizeConsultationPayload(existing, parsePayload(existing.getPayload()));
         JSONObject payload = normalizeConsultationPayload(consultation, parsePayload(consultation.getPayload()));
+        inheritPrescriptionInventoryState(payload, existingPayload);
         if (hasInventoryRelevantPrescriptionChange(existingPayload, payload))
         {
             restoreReservationsFromPayload(existingPayload);
@@ -165,6 +175,7 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         consultation.setPayload(payload.toJSONString());
         HistorySourceContext historyContext = normalizeHistorySnapshot(consultation, existing);
         int rows = consultationMapper.updateTcmConsultation(consultation);
+        if (rows != 1) throw new ServiceException("问诊保存失败，库存变动已取消");
         syncConsultationFiles(consultation, payload);
         if (historyContext.isSourceConsultation())
         {
@@ -539,6 +550,7 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         TcmConsultation existing = requireEditableConsultation(id);
         JSONObject payload = normalizeConsultationPayload(existing, parsePayload(existing.getPayload()));
         Map<String, Object> body = prescriptionData != null ? prescriptionData : new LinkedHashMap<>();
+        savePrescriptionDraftContext(existing, payload, body);
         Map<String, Object> incomingPrescription = extractPrescriptionPayload(body);
         if (incomingPrescription.isEmpty())
         {
@@ -709,11 +721,18 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
             throw new ServiceException("已发处方请先回退后再删除");
         }
 
+        if (isPrescriptionDeleted(prescription) && !isDeletedPrescriptionHoldingInventory(prescription))
+        {
+            return prepareConsultationView(existing);
+        }
+        restoreReservationIfNeeded(prescription);
         String operationTime = nowString();
         prescription.put("deletedAt", operationTime);
         prescription.put("deletedBy", actorId);
-        prescription.put("inventoryActionPending", !toMapList(prescription.get("inventoryReservation")).isEmpty());
-        prescription.remove("inventoryReleasedAt");
+        prescription.put("inventoryReservation", new ArrayList<>());
+        prescription.put("inventoryActionPending", false);
+        prescription.put("inventoryReleasedAt", operationTime);
+        prescription.put("inventorySyncedAt", null);
         applyTotals(payload, payloadBody);
         payload.put("prescriptions", prescriptions);
         syncPrimaryPrescriptionFields(payload);
@@ -1068,6 +1087,7 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         {
             throw new ServiceException("问诊记录不存在");
         }
+        if (StringUtils.isNotEmpty(existing.getDeletedAt())) return prepareConsultationView(existing);
         JSONObject payload = parsePayload(existing.getPayload());
         releaseLifecycleReservations(payload, existing.getStatus());
         existing.setPayload(payload.toJSONString());
@@ -1122,7 +1142,12 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         {
             throw new ServiceException("该记录未被软删除，无法物理删除");
         }
-        return consultationMapper.deleteTcmConsultationById(id);
+        // Legacy recycle-bin records can still hold reservations. Release those
+        // in the same transaction as the final removal; released rows are a no-op.
+        restoreReservationsFromPayload(parsePayload(existing.getPayload()));
+        int rows = consultationMapper.deleteTcmConsultationById(id);
+        if (rows != 1) throw new ServiceException("问诊删除失败，库存变动已取消");
+        return rows;
     }
 
     private TcmConsultation prepareConsultationView(TcmConsultation consultation)
@@ -1629,6 +1654,53 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         return JSON.toJSONString(entries);
     }
 
+    private void inheritPrescriptionInventoryState(JSONObject incoming, JSONObject stored)
+    {
+        List<Map<String, Object>> previous = toMapList(stored.get("prescriptions"));
+        List<Map<String, Object>> next = toMapList(incoming.get("prescriptions"));
+        for (Map<String, Object> prescription : next)
+        {
+            int index = findPrescriptionIndex(previous, getString(prescription, "id", ""));
+            Map<String, Object> authoritative = index < 0 ? java.util.Collections.emptyMap() : previous.get(index);
+            for (String key : java.util.Arrays.asList("inventoryReservation", "inventorySyncedAt",
+                    "inventoryReleasedAt", "inventoryActionPending", "deletedAt", "deletedBy"))
+            {
+                prescription.remove(key);
+                if (authoritative.containsKey(key)) prescription.put(key, authoritative.get(key));
+            }
+            if (index >= 0)
+            {
+                for (String key : java.util.Arrays.asList("rxStatus", "dispensingCompleted", "dispensingCompletedAt", "dispensedBy"))
+                {
+                    prescription.remove(key);
+                    if (authoritative.containsKey(key)) prescription.put(key, authoritative.get(key));
+                }
+            }
+        }
+        incoming.put("prescriptions", next);
+    }
+
+    private void savePrescriptionDraftContext(TcmConsultation existing, JSONObject payload,
+            Map<String, Object> body)
+    {
+        if (!(body.get("consultation") instanceof Map) || isConsultationLocked(existing)) return;
+        Map<?, ?> draft = (Map<?, ?>) body.get("consultation");
+        // Save clinical notes in the same transaction as the stock reservation.
+        // Reservation, payment and lifecycle fields remain server-owned.
+        for (String key : java.util.Arrays.asList("appointmentId", "chiefComplaint", "chiefComplaintDuration",
+                "chiefComplaintDescription", "progressOfDisease", "summary", "diff", "differentiation",
+                "acupuncture", "prognosis", "feedback", "previousPrognosisReview", "servicePriceList", "services",
+                "consultationFee", "discountType", "discountValue", "taxable", "includeRxAmount", "add3rdParty",
+                "currency", "comments", "tongueImage", "documents", "historyAndMedication",
+                "historyAndMedicationSnapshot", "historyAndMedicationSourceConsultId", "historyAndMedicationSourceConsultDate"))
+        {
+            if (draft.containsKey(key)) payload.put(key, draft.get(key));
+        }
+        if (draft.get("date") != null) existing.setConsultDate(PayloadUtils.toConsultation(java.util.Collections.singletonMap("date", draft.get("date"))).getConsultDate());
+        if (draft.get("practitionerId") != null) existing.setPractitionerId(String.valueOf(draft.get("practitionerId")));
+        if (draft.get("branchId") != null) existing.setBranchId(String.valueOf(draft.get("branchId")));
+    }
+
     private String buildPrescriptionInventoryKey(JSONObject payload, Map<String, Object> prescription, int index)
     {
         String prescriptionId = getString(prescription, "id", "rx-" + index);
@@ -1662,10 +1734,6 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
     {
         for (Map<String, Object> prescription : toMapList(payload.get("prescriptions")))
         {
-            if (isDeletedPrescriptionHoldingInventory(prescription))
-            {
-                continue;
-            }
             restoreReservationIfNeeded(prescription);
         }
     }
@@ -1676,6 +1744,15 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         boolean changed = false;
         for (Map<String, Object> prescription : prescriptions)
         {
+            if (isDeletedPrescriptionHoldingInventory(prescription))
+            {
+                restoreReservationIfNeeded(prescription);
+                prescription.put("inventoryReservation", new ArrayList<>());
+                prescription.put("inventoryActionPending", false);
+                prescription.put("inventoryReleasedAt", nowString());
+                changed = true;
+                continue;
+            }
             if (!shouldSyncLifecycleReservation(prescription, consultationStatus))
             {
                 if (prescription != null && !isPrescriptionDeleted(prescription) && !usesClinicInventory(prescription))
@@ -1729,6 +1806,8 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
             {
                 continue;
             }
+            // Older deleted consultations may still hold dispensed stock.
+            if (!toMapList(prescription.get("inventoryReservation")).isEmpty()) continue;
             List<Map<String, Object>> reservation = reservePrescription(prescription);
             prescription.put("inventoryReservation", reservation);
             prescription.put("inventorySyncedAt", syncedAt);
@@ -1750,15 +1829,12 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         {
             if (isPrescriptionDeleted(prescription))
             {
-                if (!isDeletedPrescriptionHoldingInventory(prescription))
-                {
-                    prescription.put("inventoryReservation", new ArrayList<>());
-                }
+                prescription.put("inventoryReservation", new ArrayList<>());
+                prescription.put("inventoryActionPending", false);
                 continue;
             }
             if (!usesClinicInventory(prescription))
             {
-                restoreReservationIfNeeded(prescription);
                 prescription.put("inventoryReservation", new ArrayList<>());
                 prescription.put("inventorySyncedAt", null);
                 continue;
@@ -1801,6 +1877,7 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         {
             return;
         }
+        if (isPrescriptionDeleted(prescription)) throw new ServiceException("处方已删除，请先恢复后再修改");
         if ("dispensed".equals(resolvePrescriptionStatus(prescription, null)))
         {
             throw new ServiceException("已发处方请先回退后再修改");
@@ -1900,7 +1977,7 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         {
             return false;
         }
-        return !"dispensed".equals(resolvePrescriptionStatus(prescription, consultationStatus));
+        return true;
     }
 
     private boolean usesClinicInventory(Map<String, Object> prescription)

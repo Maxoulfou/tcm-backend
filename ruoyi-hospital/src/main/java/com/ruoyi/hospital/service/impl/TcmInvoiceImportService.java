@@ -136,9 +136,12 @@ public class TcmInvoiceImportService
             if (StringUtils.isNotBlank(row.getString("inventoryId"))) {
                 item = inventoryMapper.selectTcmInventoryItemForUpdate(row.getString("inventoryId"));
                 if (item == null || StringUtils.isNotBlank(item.getDeletedAt()) || !Integer.valueOf(1).equals(item.getIsActive())
-                    || !herb.getId().equals(item.getHerbDictId()) || !category.equals(item.getCategory()) || !unit.equals(item.getUnit())) throw new ServiceException("Selected inventory does not match the herb, category, or unit.");
+                    || !matchesHerb(item, herb)
+                    || !category.equals(TcmInventoryServiceImpl.normalizeInventoryCategory(item.getCategory(), null))
+                    || !canonicalUnit(unit).equals(canonicalUnit(item.getUnit()))) throw new ServiceException("Selected inventory does not match the herb, category, or unit. Reselect the matching stock item or create a new one.");
             }
             boolean create = item == null;
+            if (!create) item.setHerbDictId(herb.getId());
             if (create) {
                 item = new TcmInventoryItem();
                 item.setName(herb.getName()); item.setHerbDictId(herb.getId()); item.setCategory(category); item.setUnit(unit);
@@ -162,6 +165,33 @@ public class TcmInvoiceImportService
         record.setSettingValue(preview.toJSONString());
         settingMapper.updateSetting(record);
         return JSONObject.of("imported", true, "invoiceId", id, "updatedCount", items.size());
+    }
+
+    private String canonicalUnit(String unit) {
+        String normalized = StringUtils.defaultString(unit).trim().toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
+        if (java.util.Arrays.asList("bag", "bags", "bag(包)", "包", "packet", "packets").contains(normalized)) return "bag";
+        if (java.util.Arrays.asList("g", "gram", "grams", "克").contains(normalized)) return "g";
+        return normalized;
+    }
+
+    private boolean matchesHerb(TcmInventoryItem item, TcmHerbDict selected) {
+        if (selected.getId().equals(item.getHerbDictId())) return true;
+        // Inventory reads may enrich an unbound legacy row by its exact name.
+        // Apply that same unique match under the row lock when importing.
+        if (StringUtils.isNotBlank(item.getHerbDictId())) {
+            TcmHerbDict bound = herbService.selectTcmHerbDictById(item.getHerbDictId());
+            if (bound != null && Integer.valueOf(1).equals(bound.getIsActive()) && StringUtils.isBlank(bound.getDeletedAt())) return false;
+        }
+        if (StringUtils.isBlank(item.getName()) || StringUtils.isBlank(selected.getName())
+                || !item.getName().trim().equalsIgnoreCase(selected.getName().trim())) return false;
+        List<TcmHerbDict> dictionary = herbService.selectTcmHerbDictList(new TcmHerbDict());
+        if (dictionary == null) return false;
+        List<TcmHerbDict> matches = new ArrayList<>();
+        for (TcmHerbDict herb : dictionary) {
+            if (Integer.valueOf(1).equals(herb.getIsActive()) && StringUtils.isBlank(herb.getDeletedAt())
+                    && item.getName().trim().equalsIgnoreCase(StringUtils.defaultString(herb.getName()).trim())) matches.add(herb);
+        }
+        return matches.size() == 1 && selected.getId().equals(matches.get(0).getId());
     }
 
     private BigDecimal requiredDecimal(JSONObject row, String key, boolean positive) {

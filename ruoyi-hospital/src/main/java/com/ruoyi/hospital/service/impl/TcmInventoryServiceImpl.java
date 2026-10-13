@@ -764,7 +764,7 @@ public class TcmInventoryServiceImpl implements ITcmInventoryService
         return normalizeInventoryCategory(category, "raw_herbs");
     }
 
-    private String normalizeInventoryCategory(String category, String blankValue)
+    static String normalizeInventoryCategory(String category, String blankValue)
     {
         if (category == null || category.trim().isEmpty())
         {

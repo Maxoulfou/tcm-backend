@@ -86,4 +86,46 @@ class TcmInvoiceImportServiceTest {
         assertEquals(true, service.confirm(Map.of("invoiceId", id)).get("alreadyImported"));
         verifyNoInteractions(inventory, herbs, inventoryMapper);
     }
+
+    @Test void legacyCategoryAndPacketAliasesMatchWithoutChangingUnitsOrQuantities() {
+        TcmHerbDict herb = new TcmHerbDict(); herb.setId("h1"); herb.setIsActive(1);
+        when(herbs.selectTcmHerbDictById("h1")).thenReturn(herb);
+        TcmInventoryItem item = new TcmInventoryItem(); item.setId("i1"); item.setHerbDictId("h1");
+        item.setCategory("Granules"); item.setUnit("bag (包)"); item.setIsActive(1); item.setQuantity(new BigDecimal("8"));
+        when(inventoryMapper.selectTcmInventoryItemForUpdate("i1")).thenReturn(item);
+        service.confirm(Map.of("invoiceId", id, "currency", "CAD", "items", List.of(Map.of(
+            "inventoryId", "i1", "herbDictId", "h1", "category", "powder", "unit", "bag", "quantity", 600, "purchasePrice", 0.29))));
+        verify(inventory).updateTcmInventoryItem(item);
+        assertEquals(new BigDecimal("608"), item.getQuantity());
+        assertEquals(new BigDecimal("0.58"), item.getPricePerUnit());
+        assertEquals("bag (包)", item.getUnit());
+    }
+
+    @Test void uniquelyNamedLegacyStockGetsTheSameDictionaryBindingAsInventoryPreview() {
+        TcmHerbDict herb = new TcmHerbDict(); herb.setId("h1"); herb.setName("通草"); herb.setIsActive(1);
+        when(herbs.selectTcmHerbDictById("h1")).thenReturn(herb);
+        when(herbs.selectTcmHerbDictList(any())).thenReturn(List.of(herb));
+        TcmInventoryItem item = new TcmInventoryItem(); item.setId("i1"); item.setName("通草");
+        item.setCategory("powder"); item.setUnit("bag"); item.setIsActive(1); item.setQuantity(BigDecimal.TEN);
+        when(inventoryMapper.selectTcmInventoryItemForUpdate("i1")).thenReturn(item);
+        service.confirm(Map.of("invoiceId", id, "currency", "CAD", "items", List.of(Map.of(
+            "inventoryId", "i1", "herbDictId", "h1", "category", "powder", "unit", "bag", "quantity", 600, "purchasePrice", 0.29))));
+        assertEquals("h1", item.getHerbDictId());
+        assertEquals(new BigDecimal("610"), item.getQuantity());
+        verify(inventory).updateTcmInventoryItem(item);
+    }
+
+    @Test void differentHerbCategoryOrMassUnitCannotBeImportedIntoSelectedStock() {
+        TcmHerbDict herb = new TcmHerbDict(); herb.setId("h1"); herb.setIsActive(1);
+        when(herbs.selectTcmHerbDictById("h1")).thenReturn(herb);
+        for (String[] mismatch : new String[][] {{"h2", "powder", "bag"}, {"h1", "raw_herbs", "bag"}, {"h1", "powder", "g"}}) {
+            TcmInventoryItem item = new TcmInventoryItem(); item.setId("i1"); item.setHerbDictId(mismatch[0]);
+            item.setCategory(mismatch[1]); item.setUnit(mismatch[2]); item.setIsActive(1); item.setQuantity(BigDecimal.TEN);
+            when(inventoryMapper.selectTcmInventoryItemForUpdate("i1")).thenReturn(item);
+            assertThrows(ServiceException.class, () -> service.confirm(Map.of("invoiceId", id, "currency", "CAD", "items", List.of(Map.of(
+                "inventoryId", "i1", "herbDictId", "h1", "category", "powder", "unit", "bag", "quantity", 600, "purchasePrice", 0.29)))));
+            assertEquals(BigDecimal.TEN, item.getQuantity());
+        }
+        verifyNoInteractions(inventory);
+    }
 }

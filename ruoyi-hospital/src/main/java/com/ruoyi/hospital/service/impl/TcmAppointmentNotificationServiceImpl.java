@@ -52,7 +52,8 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
 {
     private static final Logger log = LoggerFactory.getLogger(TcmAppointmentNotificationServiceImpl.class);
     private static final String DEFAULT_CLINIC_NAME = "OTCM Acupuncture Clinic";
-    private static final ZoneId CLINIC_ZONE = ZoneId.of("Asia/Shanghai");
+    private static final ZoneId CLINIC_ZONE = ZoneId.of("America/Toronto");
+    private java.time.Clock clock = java.time.Clock.system(CLINIC_ZONE);
     private static final DateTimeFormatter MYSQL_DATETIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final DateTimeFormatter DISPLAY_DATETIME = DateTimeFormatter.ofPattern("yyyy年MM月dd日 HH:mm");
     private static final long REMINDER_HOURS = 24L;
@@ -217,7 +218,7 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
     public void processDueNotifications()
     {
         List<TcmAppointment> appointments = appointmentMapper.selectTcmAppointmentList(new TcmAppointment());
-        LocalDateTime now = LocalDateTime.now(CLINIC_ZONE);
+        LocalDateTime now = LocalDateTime.now(clock);
         for (TcmAppointment appointment : appointments)
         {
             if (!isPatientAppointment(appointment))
@@ -230,9 +231,13 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
             {
                 continue;
             }
-            processReminderIfDue(appointment, now);
-            appointment = processCompletedAppointmentIfNeeded(appointment);
-            processFollowUpIfDue(appointment, now);
+            try {
+                processReminderIfDue(appointment, now);
+                appointment = processCompletedAppointmentIfNeeded(appointment);
+                processFollowUpIfDue(appointment, now);
+            } catch (Exception error) {
+                log.warn("Could not process scheduled notifications for appointment {}", appointment.getId(), error);
+            }
         }
     }
 
@@ -300,7 +305,7 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
         {
             return;
         }
-        LocalDateTime completedAt = parseDateTime(payload.getString(KEY_TREATMENT_COMPLETED_AT));
+        LocalDateTime completedAt = treatmentScheduleEnd(appointment);
         if (completedAt == null)
         {
             return;
@@ -365,7 +370,8 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
 
         String manageLink = buildManageLink(extractManageToken(working));
         Map<String, String> variables = buildTemplateVariables(working, patient);
-        variables.put("consentLink", defaultText(consentLink, ""));
+        variables.put("consentLink", defaultText(consentLink, "Already signed — no further action required."));
+        variables.put("consentFormLink", variables.get("consentLink"));
         variables.put("intakeLink", defaultText(intakeLink, ""));
         variables.put("manageLink", manageLink);
         variables.put("cancelLink", manageLink);
@@ -577,7 +583,7 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
             JSONObject payload = parsePayload(target.getPayload());
             if (StringUtils.isNotBlank(payload.getString(key))) return null;
             LocalDateTime pending = parseDateTime(payload.getString(key + "PendingAt"));
-            if (pending != null && pending.isAfter(LocalDateTime.now(CLINIC_ZONE).minusMinutes(10))) return null;
+            if (pending != null && pending.isAfter(LocalDateTime.now(clock).minusMinutes(10))) return null;
             payload.put(key + "PendingAt", nowString());
             payload.put(key + "PendingToken", UUID.randomUUID().toString());
             target.setPayload(payload.toJSONString());
@@ -610,7 +616,7 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
         String owner = payload.getString(KEY_NOTIFICATION_OWNER_INSTANCE);
         if (StringUtils.isNotBlank(owner) && !owner.equals(instanceId)) return false;
         String status = normalize(appointment.getStatus());
-        LocalDateTime now = LocalDateTime.now(CLINIC_ZONE);
+        LocalDateTime now = LocalDateTime.now(clock);
         if (KEY_REMINDER_SENT_AT.equals(key))
         {
             LocalDateTime start = parseDateTime(appointment.getStartTime());
@@ -618,8 +624,8 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
                     && start.isAfter(now) && !start.isAfter(now.plusHours(REMINDER_HOURS));
         }
         if (!"completed".equals(status)) return false;
-        if (KEY_AFTERCARE_SENT_AT.equals(key)) return true;
-        LocalDateTime completedAt = parseDateTime(payload.getString(KEY_TREATMENT_COMPLETED_AT));
+        LocalDateTime completedAt = treatmentScheduleEnd(appointment);
+        if (KEY_AFTERCARE_SENT_AT.equals(key)) return completedAt != null && !now.isBefore(completedAt.plusHours(1));
         return KEY_FOLLOW_UP_SENT_AT.equals(key) && completedAt != null
                 && !now.isBefore(completedAt.plusDays(FOLLOW_UP_DAYS));
     }
@@ -819,7 +825,7 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
             return false;
         }
         LocalDateTime start = parseDateTime(appointment.getStartTime());
-        return start == null || start.isAfter(LocalDateTime.now(CLINIC_ZONE));
+        return start == null || start.isAfter(LocalDateTime.now(clock));
     }
 
     private TcmAppointment requireAppointmentByManageToken(String token)
@@ -1420,8 +1426,18 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
         }
         catch (Exception e)
         {
-            return null;
+            try { return java.time.OffsetDateTime.parse(value.trim()).atZoneSameInstant(CLINIC_ZONE).toLocalDateTime(); }
+            catch (Exception ignored) {
+                try { return LocalDateTime.parse(value.trim()); }
+                catch (Exception invalid) { return null; }
+            }
         }
+    }
+
+    private LocalDateTime treatmentScheduleEnd(TcmAppointment appointment)
+    {
+        LocalDateTime end = parseDateTime(appointment.getEndTime());
+        return end != null ? end : parseDateTime(parsePayload(appointment.getPayload()).getString(KEY_TREATMENT_COMPLETED_AT));
     }
 
     private String formatDisplayDateTime(String value)
@@ -1432,7 +1448,7 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
 
     private String nowString()
     {
-        return new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+        return LocalDateTime.now(clock).format(MYSQL_DATETIME);
     }
 
     private String normalizePublicBaseUrl()

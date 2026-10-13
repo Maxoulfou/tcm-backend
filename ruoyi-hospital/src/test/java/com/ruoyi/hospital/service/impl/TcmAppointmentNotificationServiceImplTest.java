@@ -45,7 +45,7 @@ import com.ruoyi.system.mapper.SysUserMapper;
 @ExtendWith(MockitoExtension.class)
 class TcmAppointmentNotificationServiceImplTest
 {
-    private static final ZoneId CLINIC_ZONE = ZoneId.of("Asia/Shanghai");
+    private static final ZoneId CLINIC_ZONE = ZoneId.of("America/Toronto");
     private static final DateTimeFormatter MYSQL_DATETIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     @Mock
@@ -318,7 +318,7 @@ class TcmAppointmentNotificationServiceImplTest
                 "room-1",
                 "acupuncture_new",
                 "booked",
-                LocalDateTime.now(CLINIC_ZONE).plusDays(1),
+                LocalDateTime.now(CLINIC_ZONE).minusHours(3),
                 "{}");
         TcmAppointment after = appointment(
                 "apt-4",
@@ -328,7 +328,7 @@ class TcmAppointmentNotificationServiceImplTest
                 "room-1",
                 "acupuncture_new",
                 "completed",
-                LocalDateTime.now(CLINIC_ZONE).plusDays(1),
+                LocalDateTime.now(CLINIC_ZONE).minusHours(3),
                 "{}");
         AtomicReference<TcmAppointment> stored = new AtomicReference<>(after);
         when(appointmentMapper.selectTcmAppointmentById("apt-4")).thenAnswer(invocation -> stored.get());
@@ -433,7 +433,7 @@ class TcmAppointmentNotificationServiceImplTest
     void failedAftercareShouldRetryAndOnlyMarkSuccessfulDelivery()
     {
         TcmAppointment completed = appointment("retry", "patient", null, null, null, "consultation", "completed",
-                LocalDateTime.now(CLINIC_ZONE).minusHours(1), "{}");
+                LocalDateTime.now(CLINIC_ZONE).minusHours(3), "{}");
         when(appointmentMapper.selectTcmAppointmentById("retry")).thenReturn(completed);
         when(appointmentMapper.selectTcmAppointmentList(any())).thenReturn(java.util.Collections.singletonList(completed));
         when(patientService.selectTcmPatientById("patient")).thenReturn(patient("patient", "Retry", "retry@example.com", 1, "{}"));
@@ -452,7 +452,7 @@ class TcmAppointmentNotificationServiceImplTest
     void locallyCompletedImportedAppointmentShouldRetryAftercareAndSendDueFollowUp()
     {
         ReflectionTestUtils.setField(service, "instanceId", "yuanyuan");
-        LocalDateTime start = LocalDateTime.now(CLINIC_ZONE).minusHours(1);
+        LocalDateTime start = LocalDateTime.now(CLINIC_ZONE).minusHours(3);
         String importedPayload = "{\"notificationOwnerInstance\":\"legacy\"}";
         TcmAppointment before = appointment("import-complete", "patient", null, null, null,
                 "consultation", "booked", start, importedPayload);
@@ -479,6 +479,7 @@ class TcmAppointmentNotificationServiceImplTest
 
         payload.put("treatmentCompletedAt", LocalDateTime.now(CLINIC_ZONE).minusDays(3).minusMinutes(1).format(MYSQL_DATETIME));
         completed.setPayload(payload.toJSONString());
+        completed.setEndTime(payload.getString("treatmentCompletedAt"));
         service.processDueNotifications();
         service.processDueNotifications();
         verify(emailService).sendTemplateAndLog(anyString(), eq("followUp"), any(), anyString(), anyString(), eq("appointment_follow_up"));
@@ -507,7 +508,7 @@ class TcmAppointmentNotificationServiceImplTest
     void localCompletionWithoutConfiguredInstanceIdShouldReleaseForeignNotificationOwner()
     {
         ReflectionTestUtils.setField(service, "instanceId", "");
-        LocalDateTime start = LocalDateTime.now(CLINIC_ZONE).minusHours(1);
+        LocalDateTime start = LocalDateTime.now(CLINIC_ZONE).minusHours(3);
         String importedPayload = "{\"notificationOwnerInstance\":\"legacy\"}";
         TcmAppointment before = appointment("import-default", "patient", null, null, null,
                 "consultation", "confirmed", start, importedPayload);
@@ -523,6 +524,7 @@ class TcmAppointmentNotificationServiceImplTest
         assertTrue(StringUtils.isBlank(payload.getString("notificationOwnerInstance")));
         payload.put("treatmentCompletedAt", LocalDateTime.now(CLINIC_ZONE).minusDays(3).minusMinutes(1).format(MYSQL_DATETIME));
         completed.setPayload(payload.toJSONString());
+        completed.setEndTime(payload.getString("treatmentCompletedAt"));
         service.processDueNotifications();
 
         verify(emailService).sendTemplateAndLog(anyString(), eq("followUp"), any(), anyString(), anyString(), eq("appointment_follow_up"));
@@ -532,7 +534,7 @@ class TcmAppointmentNotificationServiceImplTest
     void aftercareMustWaitUntilCompletionTransactionCommits()
     {
         TcmAppointment completed = appointment("commit", "patient", null, null, null, "consultation", "completed",
-                LocalDateTime.now(CLINIC_ZONE).minusHours(1), "{}");
+                LocalDateTime.now(CLINIC_ZONE).minusHours(3), "{}");
         when(appointmentMapper.selectTcmAppointmentById("commit")).thenReturn(completed);
         when(appointmentMapper.selectTcmAppointmentList(any())).thenReturn(java.util.Collections.singletonList(completed));
         when(patientService.selectTcmPatientById("patient")).thenReturn(patient("patient", "Commit", "commit@example.com", 1, "{}"));
@@ -691,6 +693,58 @@ class TcmAppointmentNotificationServiceImplTest
         appointment.setEndTime(startTime.plusMinutes(60).format(MYSQL_DATETIME));
         appointment.setPayload(payload);
         return appointment;
+    }
+
+    @Test
+    void careScheduleUsesTorontoAppointmentEndInsteadOfCompletionClickTime()
+    {
+        java.time.Instant now = java.time.Instant.parse("2026-10-13T17:00:00Z"); // 13:00 Toronto
+        ReflectionTestUtils.setField(service, "clock", java.time.Clock.fixed(now, CLINIC_ZONE));
+        TcmAppointment appt = appointment("boundary", "patient", null, null, null, "consultation", "completed",
+                LocalDateTime.of(2026, 10, 13, 11, 0), "{\"treatmentCompletedAt\":\"2026-10-13 12:55:00\"}");
+        when(appointmentMapper.selectTcmAppointmentById(appt.getId())).thenReturn(appt);
+        when(appointmentMapper.selectTcmAppointmentList(any())).thenReturn(java.util.Collections.singletonList(appt));
+        when(patientService.selectTcmPatientById("patient")).thenReturn(patient("patient", "Boundary", "qa@example.invalid", 1, "{}"));
+        appt.setEndTime("2026-10-13 12:00:01");
+        service.processDueNotifications();
+        org.mockito.Mockito.verifyNoInteractions(emailService);
+        appt.setEndTime("2026-10-13 12:00:00");
+        service.processDueNotifications();
+        service.processDueNotifications();
+        verify(emailService).sendTemplateAndLog(anyString(), eq("aftercare"), any(), anyString(), anyString(), anyString());
+        ReflectionTestUtils.setField(service, "clock", java.time.Clock.fixed(java.time.Instant.parse("2026-10-16T15:59:59Z"), CLINIC_ZONE));
+        service.processDueNotifications();
+        verify(emailService, org.mockito.Mockito.never()).sendTemplateAndLog(anyString(), eq("followUp"), any(), anyString(), anyString(), anyString());
+        ReflectionTestUtils.setField(service, "clock", java.time.Clock.fixed(java.time.Instant.parse("2026-10-16T16:00:00Z"), CLINIC_ZONE));
+        service.processDueNotifications();
+        service.processDueNotifications();
+        verify(emailService).sendTemplateAndLog(anyString(), eq("followUp"), any(), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void completedFutureAppointmentDoesNotSendAftercareEarly()
+    {
+        TcmAppointment appt = appointment("future-completion", "patient", null, null, null, "consultation", "completed",
+                LocalDateTime.now(CLINIC_ZONE).plusDays(1), "{}");
+        when(appointmentMapper.selectTcmAppointmentById(appt.getId())).thenReturn(appt);
+        when(appointmentMapper.selectTcmAppointmentList(any())).thenReturn(java.util.Collections.singletonList(appt));
+        lenient().when(patientService.selectTcmPatientById("patient")).thenReturn(patient("patient", "Future", "qa@example.invalid", 1, "{}"));
+        service.processDueNotifications();
+        org.mockito.Mockito.verifyNoInteractions(emailService);
+    }
+
+    @Test
+    void confirmationExplainsAlreadySignedConsentInsteadOfLeavingBlankLink()
+    {
+        TcmAppointment appt = appointment("signed", "patient", null, null, null, "consultation", "booked",
+                LocalDateTime.now(CLINIC_ZONE).plusDays(1), "{}");
+        when(appointmentMapper.selectTcmAppointmentById(appt.getId())).thenReturn(appt);
+        when(patientService.selectTcmPatientById("patient")).thenReturn(patient("patient", "Signed", "qa@example.invalid", 1, "{\"latestIntakeCompleted\":true,\"latestIntakeSource\":\"public_intake_form\"}"));
+        service.handleAppointmentCreated(appt);
+        verify(emailService).sendTemplateAndLog(anyString(), eq("appointmentConfirmation"),
+                argThat(variables -> "Already signed — no further action required.".equals(variables.get("consentLink"))),
+                anyString(), anyString(), anyString());
+        verify(patientService, org.mockito.Mockito.never()).generateConsentToken(anyString());
     }
 
     private TcmPatient patient(String id, String name, String email, Integer consentSigned, String payload)

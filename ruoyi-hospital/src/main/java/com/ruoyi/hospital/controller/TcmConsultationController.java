@@ -249,7 +249,7 @@ public class TcmConsultationController
     public Map<String, Object> hardDeletePrescription(
             @PathVariable String id,
             @PathVariable String prescriptionId,
-            @RequestParam(value = "restoreInventory", required = false, defaultValue = "false") boolean restoreInventory)
+            @RequestParam(value = "restoreInventory", required = false, defaultValue = "true") boolean restoreInventory)
     {
         ensureConsultationAccessible(requireConsultation(id));
         return PayloadUtils.flatten(

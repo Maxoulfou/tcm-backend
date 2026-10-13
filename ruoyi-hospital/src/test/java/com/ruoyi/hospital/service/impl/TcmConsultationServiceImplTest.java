@@ -613,6 +613,125 @@ class TcmConsultationServiceImplTest
         assertTrue(error.getMessage().contains("当归库存不足"));
     }
 
+    @Test
+    void deletionImmediatelyReleasesInventoryAndRepeatedDeletionDoesNotReleaseTwice()
+    {
+        TcmConsultation existing = consultation("delete-once", payloadWithPrescription(prescription("rx",
+                items(item("黄芪", "10", "g", "stock", null, "70")),
+                reservations(reservation("stock", "黄芪", "70", null)), "editing")));
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        when(inventoryService.restoreFromPrescription(anyList(), eq("raw_herbs"))).thenReturn(successResult());
+        service.deletePrescription(existing.getId(), "rx", Map.of(), "qa");
+        service.deletePrescription(existing.getId(), "rx", Map.of(), "qa");
+        JSONObject deleted = JSON.parseObject(existing.getPayload()).getJSONArray("prescriptions").getJSONObject(0);
+        assertTrue(deleted.getJSONArray("inventoryReservation").isEmpty());
+        assertEquals(false, deleted.getBooleanValue("inventoryActionPending"));
+        verify(inventoryService).restoreFromPrescription(anyList(), eq("raw_herbs"));
+        assertThrows(ServiceException.class, () -> service.syncPrescription(existing.getId(),
+                Map.of("prescription", prescription("rx", new ArrayList<>(), null, "editing")), "qa"));
+    }
+
+    @Test
+    void savingUnchangedPrescriptionCannotEraseServerReservation()
+    {
+        TcmConsultation existing = consultation("metadata", payloadWithPrescription(prescription("rx",
+                items(item("黄芪", "10", "g", "stock", null, "70")), reservations(reservation("stock", "黄芪", "70", null)), "editing")));
+        existing.setStatus("draft");
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        when(consultationMapper.updateTcmConsultation(any())).thenReturn(1);
+        TcmConsultation incoming = consultation(existing.getId(), payloadWithPrescription(prescription("rx",
+                items(item("黄芪", "10", "g", "stock", null, "70")), new ArrayList<>(), "editing")));
+        incoming.setStatus("draft");
+        service.updateTcmConsultation(incoming, "qa");
+        assertEquals("70", JSON.parseObject(incoming.getPayload()).getJSONArray("prescriptions").getJSONObject(0)
+                .getJSONArray("inventoryReservation").getJSONObject(0).getString("reservedQty"));
+        org.mockito.Mockito.verifyNoInteractions(inventoryService);
+    }
+
+    @Test
+    void copiedPrescriptionIsReservedWhenParentIsCreatedAndIgnoresCopiedReservation()
+    {
+        TcmConsultation incoming = consultation("copy", payloadWithPrescription(prescription("rx",
+                items(item("黄芪", "10", "g", "stock", null, "70")), reservations(reservation("old-stock", "黄芪", "700", null)), "editing")));
+        incoming.setStatus("draft");
+        when(consultationMapper.insertTcmConsultation(incoming)).thenReturn(1);
+        when(inventoryService.deductFromPrescription(anyList(), eq("raw_herbs"))).thenReturn(deductSuccess("stock", "黄芪", "70", null));
+        service.insertTcmConsultation(incoming);
+        assertEquals("stock", JSON.parseObject(incoming.getPayload()).getJSONArray("prescriptions").getJSONObject(0)
+                .getJSONArray("inventoryReservation").getJSONObject(0).getString("inventoryId"));
+        verify(inventoryService, never()).restoreFromPrescription(anyList(), anyString());
+        verify(inventoryService).deductFromPrescription(anyList(), eq("raw_herbs"));
+    }
+
+    @Test
+    void prescriptionAutosavePersistsClinicalNotesWithoutAcceptingLifecycleFields()
+    {
+        TcmConsultation existing = consultation("context", new JSONObject()); existing.setStatus("draft");
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        when(inventoryService.deductFromPrescription(anyList(), eq("raw_herbs"))).thenReturn(deductSuccess("stock", "黄芪", "70", null));
+        service.syncPrescription(existing.getId(), Map.of("prescription", prescription("rx",
+                items(item("黄芪", "10", "g", "stock", null, "70")), null, "editing"),
+                "consultation", Map.of("chiefComplaint", "Saved with stock", "progressOfDisease", "Clinical notes",
+                        "status", "paid", "deletedAt", "bad", "paymentRecords", List.of(Map.of("amount", 999)))), "qa");
+        JSONObject saved = JSON.parseObject(existing.getPayload());
+        assertEquals("Saved with stock", saved.getString("chiefComplaint"));
+        assertEquals("Clinical notes", saved.getString("progressOfDisease"));
+        assertEquals("draft", existing.getStatus());
+        assertEquals(null, existing.getDeletedAt());
+        assertTrue(saved.getJSONArray("paymentRecords") == null || saved.getJSONArray("paymentRecords").isEmpty());
+        assertEquals(1, saved.getJSONArray("prescriptions").getJSONObject(0).getJSONArray("inventoryReservation").size());
+    }
+
+    @Test
+    void deletedParentRejectsLateSaveAndCannotLoseItsDeletedMarker()
+    {
+        TcmConsultation existing = consultation("late", new JSONObject()); existing.setStatus("draft"); existing.setDeletedAt("2026-10-13 09:00:00");
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        assertThrows(ServiceException.class, () -> service.updateTcmConsultation(consultation("late", new JSONObject()), "qa"));
+        verify(consultationMapper, never()).updateTcmConsultation(any());
+        org.mockito.Mockito.verifyNoInteractions(inventoryService);
+    }
+
+    @Test
+    void parentDeletionAndRestoreIncludeDispensedStockAndAreIdempotent()
+    {
+        TcmConsultation existing = consultation("dispensed-parent", payloadWithPrescription(prescription("rx",
+                items(item("黄芪", "10", "g", "stock", null, "70")), reservations(reservation("stock", "黄芪", "70", null)), "dispensed")));
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        when(inventoryService.restoreFromPrescription(anyList(), eq("raw_herbs"))).thenReturn(successResult());
+        when(inventoryService.deductFromPrescription(anyList(), eq("raw_herbs"))).thenReturn(deductSuccess("stock", "黄芪", "70", null));
+        service.softDeleteTcmConsultation(existing.getId()); service.softDeleteTcmConsultation(existing.getId());
+        assertTrue(JSON.parseObject(existing.getPayload()).getJSONArray("prescriptions").getJSONObject(0).getJSONArray("inventoryReservation").isEmpty());
+        service.restoreTcmConsultation(existing.getId()); service.restoreTcmConsultation(existing.getId());
+        verify(inventoryService).restoreFromPrescription(anyList(), eq("raw_herbs"));
+        verify(inventoryService).deductFromPrescription(anyList(), eq("raw_herbs"));
+    }
+
+    @Test
+    void restoreLegacyDeletedParentDoesNotDeductStockThatWasStillHeld()
+    {
+        TcmConsultation existing = consultation("legacy-held", payloadWithPrescription(prescription("rx",
+                items(item("黄芪", "10", "g", "stock", null, "70")), reservations(reservation("stock", "黄芪", "70", null)), "dispensed")));
+        existing.setDeletedAt("2026-09-01 09:00:00");
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        service.restoreTcmConsultation(existing.getId());
+        org.mockito.Mockito.verifyNoInteractions(inventoryService);
+        assertEquals(null, existing.getDeletedAt());
+    }
+
+    @Test
+    void permanentlyDeletingLegacyParentRestoresRemainingReservation()
+    {
+        TcmConsultation existing = consultation("legacy-purge", payloadWithPrescription(prescription("rx",
+                items(item("黄芪", "10", "g", "stock", null, "70")), reservations(reservation("stock", "黄芪", "70", null)), "dispensed")));
+        existing.setDeletedAt("2026-09-01 09:00:00");
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        when(consultationMapper.deleteTcmConsultationById(existing.getId())).thenReturn(1);
+        when(inventoryService.restoreFromPrescription(anyList(), eq("raw_herbs"))).thenReturn(successResult());
+        assertEquals(1, service.hardDeleteTcmConsultation(existing.getId()));
+        verify(inventoryService).restoreFromPrescription(anyList(), eq("raw_herbs"));
+    }
+
     private TcmAppointment appointment(String id, String startTime, String practitionerId)
     {
         TcmAppointment appointment = new TcmAppointment();
