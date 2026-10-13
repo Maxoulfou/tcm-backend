@@ -24,7 +24,10 @@ import legacy_integration_diagnostics as diagnostics
 EVENT = 'checkout.session.async_payment_succeeded'
 ENDPOINT_URLS = ('https://www.otcm.app/api/stripe/webhook',
                  'https://yuanyuanyiyuan.oksja.cn/api/stripe/webhook')
-NGINX_CONFIG = pathlib.Path('/www/server/panel/vhost/nginx/otcm.app.conf')
+NGINX_CONFIG_CANDIDATES = (
+    pathlib.Path('/www/server/panel/vhost/nginx/otcm.app.conf'),
+    pathlib.Path('/www/server/panel/vhost/nginx/www.otcm.app.conf'),
+)
 NGINX_BINARY = '/www/server/nginx/sbin/nginx'
 NGINX_BACKUP_DIR = pathlib.Path('/www/backup/otcm-webhook-routing')
 MARKER = '# otcm-webhook-redirect-exemption-v1'
@@ -192,10 +195,33 @@ def confirmed_api_proxy(proxies):
                and not proxy.get('conditions') for proxy in proxies)
 
 
+def select_nginx_config():
+    matches = []
+    for path in NGINX_CONFIG_CANDIDATES:
+        if not path.is_file() or path.is_symlink() or path.resolve() != path:
+            continue
+        if not 0 < path.stat().st_size <= 256 * 1024:
+            continue
+        original = path.read_bytes()
+        try:
+            text = original.decode('utf-8')
+            # This validates both target server names and the exact known
+            # redirect block; an unrelated file can never become the target.
+            if MARKER in text:
+                declarations = re.findall(r'\bserver_name\s+([^;]+);', text)
+                if len(declarations) != 1 or set(declarations[0].split()) != {'otcm.app', 'www.otcm.app'}:
+                    continue
+            nginx_patch(text)
+        except (ValueError, UnicodeError):
+            continue
+        matches.append((path, original))
+    if len(matches) != 1:
+        raise ValueError('Expected one non-symlink clinic config among the two diagnosed site paths')
+    return matches[0]
+
+
 def nginx_plan():
-    if NGINX_CONFIG.is_symlink() or NGINX_CONFIG.resolve() != NGINX_CONFIG:
-        raise ValueError('Unexpected clinic config path')
-    original = NGINX_CONFIG.read_bytes()
+    config, original = select_nginx_config()
     text = original.decode('utf-8')
     patched, changed = nginx_patch(text)
     replacement = replacement_for(text)
@@ -204,13 +230,13 @@ def nginx_plan():
     proxies = [proxy for site in structure.get('sites', []) for proxy in site.get('structure', {}).get('clinic_loopback_proxies', [])]
     if not confirmed_api_proxy(proxies):
         raise ValueError('Existing API route is not the confirmed clinic loopback backend')
-    report = {'ok': True, 'config_sha256': digest(original), 'proposed_sha256': digest(patched.encode()),
+    report = {'ok': True, 'config_path': str(config), 'config_sha256': digest(original), 'proposed_sha256': digest(patched.encode()),
               'redirect_block_sha256': digest(block.encode()),
               'change_required': changed, 'webhook_paths_exempted': ['/api/stripe/webhook', '/api/stripe/webhook/'],
               'backend_preserved': 'http://127.0.0.1:8006',
               'other_root_requests_redirect_to': re.search(r'return 301 (\S+);', replacement).group(1),
               'replacement_directives': replacement.splitlines()}
-    return original, patched.encode(), report
+    return config, original, patched.encode(), report
 
 
 def local_http_status(host, path, method):
@@ -240,8 +266,8 @@ def routes_healthy(probes):
             and probes.get('GET www.otcm.app/booking') == 200)
 
 
-def atomic_config_write(content, metadata):
-    descriptor, path = tempfile.mkstemp(prefix='.otcm-webhook-', dir=str(NGINX_CONFIG.parent))
+def atomic_config_write(config, content, metadata):
+    descriptor, path = tempfile.mkstemp(prefix='.otcm-webhook-', dir=str(config.parent))
     try:
         with os.fdopen(descriptor, 'wb') as output:
             output.write(content)
@@ -249,14 +275,14 @@ def atomic_config_write(content, metadata):
             os.fsync(output.fileno())
         os.chmod(path, metadata.st_mode & 0o7777)
         os.chown(path, metadata.st_uid, metadata.st_gid)
-        os.replace(path, NGINX_CONFIG)
+        os.replace(path, config)
     finally:
         if os.path.exists(path):
             os.unlink(path)
 
 
 def repair_nginx(expected_hash, expected_redirect_hash):
-    original, patched, report = nginx_plan()
+    config, original, patched, report = nginx_plan()
     if not re.fullmatch(r'[0-9a-f]{64}', expected_hash or '') or report['config_sha256'] != expected_hash:
         raise ValueError('Clinic config differs from the inspected SHA256')
     if not re.fullmatch(r'[0-9a-f]{64}', expected_redirect_hash or '') or report['redirect_block_sha256'] != expected_redirect_hash:
@@ -269,20 +295,20 @@ def repair_nginx(expected_hash, expected_redirect_hash):
         report['ok'] = report['verified']
         return report
     # A previous readonly inspection must match just before the atomic write.
-    if NGINX_CONFIG.read_bytes() != original:
+    if config.is_symlink() or config.resolve() != config or config.read_bytes() != original:
         raise ValueError('Clinic config changed during inspection')
-    metadata = NGINX_CONFIG.stat()
+    metadata = config.stat()
     backup_dir = NGINX_BACKUP_DIR
     backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
-    backup = backup_dir / ('otcm.app.' + stamp + '.conf')
+    backup = backup_dir / (config.stem + '.' + stamp + '.conf')
     with os.fdopen(os.open(str(backup), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
         output.write(original)
     os.chmod(backup, 0o600)
     report['backup'] = str(backup)
     report['updated'] = False
     try:
-        atomic_config_write(patched, metadata)
+        atomic_config_write(config, patched, metadata)
         diagnostics.command([NGINX_BINARY, '-t'])
         diagnostics.command([NGINX_BINARY, '-s', 'reload'])
         for attempt in range(3):
@@ -297,11 +323,11 @@ def repair_nginx(expected_hash, expected_redirect_hash):
     except Exception as error:
         report.update(diagnostics.failure(error))
         try:
-            atomic_config_write(original, metadata)
+            atomic_config_write(config, original, metadata)
             diagnostics.command([NGINX_BINARY, '-t'])
             diagnostics.command([NGINX_BINARY, '-s', 'reload'])
             report['rolled_back'] = True
-            report['rollback_verified_sha256'] = digest(NGINX_CONFIG.read_bytes()) == digest(original)
+            report['rollback_verified_sha256'] = digest(config.read_bytes()) == digest(original)
         except Exception as rollback_error:
             report['rolled_back'] = False
             report['rollback_error'] = diagnostics.failure(rollback_error)
@@ -353,6 +379,30 @@ class RepairTests(unittest.TestCase):
             self.assertTrue(confirmed_api_proxy([{'target': 'http://127.0.0.1:8006', 'locations': [{'path': '/api/', 'modifier': modifier}], 'conditions': []}]))
         self.assertFalse(confirmed_api_proxy([{'target': 'http://127.0.0.1:8006', 'locations': [{'path': '/', 'modifier': '^~'}], 'conditions': []}]))
 
+    def test_selects_only_existing_confirmed_www_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            missing, selected = root / 'otcm.app.conf', root / 'www.otcm.app.conf'
+            text = 'server { server_name otcm.app www.otcm.app; if ($host = otcm.app) { return 301 https://www.otcm.app$request_uri; } }'
+            selected.write_text(text, encoding='utf-8')
+            with mock.patch(__name__ + '.NGINX_CONFIG_CANDIDATES', (missing, selected)):
+                self.assertEqual(select_nginx_config(), (selected, text.encode()))
+                missing.write_text(text, encoding='utf-8')
+                with self.assertRaises(ValueError):
+                    select_nginx_config()
+
+    def test_rejects_symlink_or_unrelated_site(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory).resolve() / 'www.otcm.app.conf'
+            path.write_text('server { server_name unrelated.example; }', encoding='utf-8')
+            with mock.patch(__name__ + '.NGINX_CONFIG_CANDIDATES', (path,)):
+                with self.assertRaises(ValueError):
+                    select_nginx_config()
+                path.write_text('server { server_name otcm.app www.otcm.app; if ($host = otcm.app) { return 301 https://www.otcm.app$request_uri; } }', encoding='utf-8')
+                with mock.patch.object(pathlib.Path, 'is_symlink', return_value=True):
+                    with self.assertRaises(ValueError):
+                        select_nginx_config()
+
     def test_route_probe_requires_rejected_unsigned_posts_and_page_redirect(self):
         probes = {'POST ' + host + path: 400 for host in ('otcm.app', 'www.otcm.app') for path in ('/api/stripe/webhook', '/api/stripe/webhook/')}
         probes.update({'GET otcm.app/booking': 301, 'GET www.otcm.app/booking': 200})
@@ -382,10 +432,10 @@ class RepairTests(unittest.TestCase):
             original, patched, block_hash = b'original fixture config', b'changed fixture config', 'b' * 64
             config.write_bytes(original)
             plan = {'ok': True, 'change_required': True, 'config_sha256': digest(original), 'redirect_block_sha256': block_hash}
-            with mock.patch.multiple(__name__, NGINX_CONFIG=config, NGINX_BACKUP_DIR=backup), \
-                 mock.patch(__name__ + '.nginx_plan', return_value=(original, patched, plan)), \
+            with mock.patch(__name__ + '.NGINX_BACKUP_DIR', backup), \
+                 mock.patch(__name__ + '.nginx_plan', return_value=(config, original, patched, plan)), \
                  mock.patch(__name__ + '.route_probe', return_value={'POST root': 301}), \
-                 mock.patch(__name__ + '.atomic_config_write', side_effect=lambda content, metadata: config.write_bytes(content)), \
+                 mock.patch(__name__ + '.atomic_config_write', side_effect=lambda path, content, metadata: path.write_bytes(content)), \
                  mock.patch.object(time, 'sleep'), \
                  mock.patch.object(diagnostics, 'command', return_value='') as command:
                 report = repair_nginx(digest(original), block_hash)
@@ -428,7 +478,7 @@ def main():
             report['stripe'] = repair_stripe(key, apply=options.mode == 'repair-stripe-events')
         if options.mode == 'inspect':
             try:
-                _, _, report['nginx'] = nginx_plan()
+                _, _, _, report['nginx'] = nginx_plan()
             except Exception as error:
                 report['nginx'] = diagnostics.failure(error)
         elif options.mode == 'repair-webhook-routing':
