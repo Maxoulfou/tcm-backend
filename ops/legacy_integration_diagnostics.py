@@ -423,6 +423,34 @@ def safe_condition(header):
             'known_variables': sorted(set(re.findall(r'\$(?:host|http_host|server_name|scheme|https|server_port|uri|request_uri)\b', value)))}
 
 
+def nginx_known_structure(text):
+    """Diagnose known routing directives even when unrelated nginx modules use
+    syntax outside the small AST parser. This never authorizes a config edit.
+    """
+    conditions = []
+    for match in re.finditer(r'\bif\s*\(([^{}\n]{1,300})\)\s*\{([^{}]{0,4000})\}', text):
+        condition = safe_condition(['if', '(' + match[1] + ')'])
+        conditions.append((match.start(), match.end(), condition, hashlib.sha256(match.group().encode('utf-8')).hexdigest()))
+    locations = []
+    for match in re.finditer(r'\blocation\s+(?:(=|\^~)\s+)?(/api/|/api/stripe/webhook/?)\s*\{([^{}]{0,8000})\}', text):
+        locations.append((match.start(), match.end(), {'path': match[2], 'modifier': match[1] or ''}))
+    returns, proxies = [], []
+    for match in re.finditer(r'\breturn\s+(301|302|307|308)\s+([^;]+);', text):
+        scoped_conditions = [item[2] for item in conditions if item[0] <= match.start() < item[1]]
+        scoped_locations = [item[2] for item in locations if item[0] <= match.start() < item[1]]
+        blocks = [item for item in conditions if item[0] <= match.start() < item[1]]
+        returns.append({'status': int(match[1]), 'target': safe_url(match[2], nginx=True),
+                        'conditions': scoped_conditions, 'locations': scoped_locations,
+                        'parent_block_scope': 'matched-condition' if scoped_conditions else 'unresolved',
+                        'line': text.count('\n', 0, match.start()) + 1,
+                        'condition_block_sha256': blocks[0][3] if len(blocks) == 1 else None})
+    for start, end, location in locations:
+        for match in re.finditer(r'\bproxy_pass\s+http://(?:127\.0\.0\.1|localhost):8006\s*;', text[start:end]):
+            proxies.append({'target': 'http://127.0.0.1:8006', 'locations': [location], 'conditions': []})
+    return {'return_rules': returns, 'clinic_loopback_proxies': proxies, 'parser_mode': 'known-directives-only',
+            'unrelated_syntax_not_parsed': True}
+
+
 def nginx_structure(text):
     returns, proxies = [], []
 
@@ -452,8 +480,12 @@ def nginx_structure(text):
                     next_locations = locations + [{'path': location, 'modifier': header[1] if len(header) == 3 and header[1] in ('=', '^~', '~', '~*') else ''}]
                 walk(node['children'], next_conditions, next_locations)
 
-    walk(nginx_nodes(text))
-    return {'return_rules': returns, 'clinic_loopback_proxies': proxies}
+    try:
+        walk(nginx_nodes(text))
+        return {'return_rules': returns, 'clinic_loopback_proxies': proxies, 'parser_mode': 'structured'}
+    except ValueError:
+        # Do not emit any source or failing token: nginx configs can hold keys.
+        return nginx_known_structure(text)
 
 
 def check_nginx():
@@ -546,6 +578,17 @@ class OfflineTests(unittest.TestCase):
         self.assertEqual(structure['return_rules'][0]['conditions'], [{'variable': '$host', 'operator': '=', 'value': 'otcm.app'}])
         self.assertEqual(structure['clinic_loopback_proxies'], [{'target': 'http://127.0.0.1:8006', 'locations': [{'path': '/api/', 'modifier': ''}], 'conditions': []}])
         self.assertNotIn('private-key', json.dumps(structure))
+
+    def test_nginx_known_directives_ignore_unrelated_regex_braces(self):
+        text = '''server { server_name otcm.app www.otcm.app;
+        if ($host = "otcm.app") { return 301 https://www.otcm.app$request_uri; }
+        location /api/ { proxy_pass http://127.0.0.1:8006; }
+        location ~ token-[a-z]{4,16} { return 404; }
+        }'''
+        structure = nginx_known_structure(text)
+        self.assertEqual(structure['return_rules'][0]['conditions'], [{'variable': '$host', 'operator': '=', 'value': 'otcm.app'}])
+        self.assertEqual(len(structure['clinic_loopback_proxies']), 1)
+        self.assertNotIn('token-', json.dumps(structure))
 
 
 def main():
