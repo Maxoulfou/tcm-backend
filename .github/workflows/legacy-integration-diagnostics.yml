@@ -1,0 +1,90 @@
+name: Legacy Integration Diagnostics (read only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Fixed legacy clinic server (no writes or email sending)
+        required: true
+        default: '43.166.154.98'
+        type: choice
+        options:
+          - '43.166.154.98'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: legacy-integration-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify diagnostic parser and redaction offline
+        run: python3 -B ops/legacy_integration_diagnostics.py --self-test
+      - name: Read clinic service integration status
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$TARGET" == '43.166.154.98' && "$DEPLOY_HOST" == '43.166.154.98' ]] || { echo '::error::Legacy host does not match the fixed diagnostic target.'; exit 1; }
+          [[ "$DEPLOY_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ && -n "$DEPLOY_SSH_KEY" ]] || { echo '::error::Legacy SSH configuration is unavailable.'; exit 1; }
+          PORT="${DEPLOY_PORT:-22}"
+          [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) || { echo '::error::Invalid SSH port.'; exit 1; }
+          mkdir -p "$RUNNER_TEMP/legacy-diagnostics"
+          printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' > "$RUNNER_TEMP/legacy-diagnostics/key"
+          # Existing legacy deployments used first-use keyscan. This limitation is
+          # explicit in the report; never silently substitute the new production key.
+          ssh-keyscan -T 15 -p "$PORT" "$TARGET" > "$RUNNER_TEMP/legacy-diagnostics/known_hosts" 2>/dev/null
+          test -s "$RUNNER_TEMP/legacy-diagnostics/known_hosts"
+          set +e
+          ssh -p "$PORT" -i "$RUNNER_TEMP/legacy-diagnostics/key" \
+            -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o LogLevel=ERROR \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/legacy-diagnostics/known_hosts" \
+            "$DEPLOY_USER@$TARGET" 'python3 -B - --target 43.166.154.98' \
+            < ops/legacy_integration_diagnostics.py \
+            > "$RUNNER_TEMP/legacy-diagnostics/report.json" 2> "$RUNNER_TEMP/legacy-diagnostics/ssh-error"
+          STATUS=$?
+          set -e
+          export DIAGNOSTIC_EXIT_STATUS="$STATUS"
+          python3 - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'legacy-diagnostics/report.json'
+          try:
+              report = json.loads(path.read_text())
+              assert report.get('read_only') is True and report.get('target') == '43.166.154.98'
+              valid = True
+          except Exception:
+              valid = False
+              report = {'read_only': True, 'target': '43.166.154.98', 'ok': False,
+                        'error_type': 'RemoteDiagnosticUnavailable', 'ssh_exit_status': int(os.environ['DIAGNOSTIC_EXIT_STATUS'])}
+              path.write_text(json.dumps(report, indent=2))
+          print(json.dumps(report, indent=2))
+          if not valid:
+              raise SystemExit(2)
+          PY
+          exit "$STATUS"
+      - name: Store sanitized diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-integration-diagnostics
+          path: ${{ runner.temp }}/legacy-diagnostics/report.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Remove runner SSH material
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/legacy-diagnostics/key" "$RUNNER_TEMP/legacy-diagnostics/known_hosts" "$RUNNER_TEMP/legacy-diagnostics/ssh-error"
