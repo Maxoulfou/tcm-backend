@@ -233,7 +233,7 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
             }
             try {
                 processReminderIfDue(appointment, now);
-                appointment = processCompletedAppointmentIfNeeded(appointment);
+                appointment = processScheduledCareIfNeeded(appointment);
                 processFollowUpIfDue(appointment, now);
             } catch (Exception error) {
                 log.warn("Could not process scheduled notifications for appointment {}", appointment.getId(), error);
@@ -241,21 +241,21 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
         }
     }
 
-    private TcmAppointment processCompletedAppointmentIfNeeded(TcmAppointment appointment)
+    private TcmAppointment processScheduledCareIfNeeded(TcmAppointment appointment)
     {
-        if (!"completed".equals(normalize(appointment.getStatus())))
+        if (!isCareStatus(appointment))
         {
             return appointment;
         }
         // The scheduler's list can become stale while a user cancels or reopens treatment.
         TcmAppointment current = appointmentMapper.selectTcmAppointmentById(appointment.getId());
-        if (current == null || !"completed".equals(normalize(current.getStatus())))
+        if (!isCareStatus(current))
         {
             return current != null ? current : appointment;
         }
         appointment = current;
         JSONObject payload = parsePayload(appointment.getPayload());
-        if (StringUtils.isBlank(payload.getString(KEY_TREATMENT_COMPLETED_AT)))
+        if ("completed".equals(normalize(appointment.getStatus())) && StringUtils.isBlank(payload.getString(KEY_TREATMENT_COMPLETED_AT)))
         {
             appointment = stampTreatmentCompletedAt(appointment, false);
             payload = parsePayload(appointment != null ? appointment.getPayload() : null);
@@ -296,7 +296,7 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
 
     private void processFollowUpIfDue(TcmAppointment appointment, LocalDateTime now)
     {
-        if (!"completed".equals(normalize(appointment.getStatus())))
+        if (!isCareStatus(appointment))
         {
             return;
         }
@@ -623,7 +623,7 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
             return ("booked".equals(status) || "confirmed".equals(status)) && start != null
                     && start.isAfter(now) && !start.isAfter(now.plusHours(REMINDER_HOURS));
         }
-        if (!"completed".equals(status)) return false;
+        if (!isCareStatus(appointment)) return false;
         LocalDateTime completedAt = treatmentScheduleEnd(appointment);
         if (KEY_AFTERCARE_SENT_AT.equals(key)) return completedAt != null && !now.isBefore(completedAt.plusHours(1));
         return KEY_FOLLOW_UP_SENT_AT.equals(key) && completedAt != null
@@ -1438,6 +1438,13 @@ public class TcmAppointmentNotificationServiceImpl implements ITcmAppointmentNot
     {
         LocalDateTime end = parseDateTime(appointment.getEndTime());
         return end != null ? end : parseDateTime(parsePayload(appointment.getPayload()).getString(KEY_TREATMENT_COMPLETED_AT));
+    }
+
+    private boolean isCareStatus(TcmAppointment appointment)
+    {
+        if (appointment == null) return false;
+        String status = normalize(appointment.getStatus());
+        return "completed".equals(status) || "confirmed".equals(status) || "booked".equals(status);
     }
 
     private String formatDisplayDateTime(String value)

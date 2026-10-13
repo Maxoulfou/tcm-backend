@@ -747,6 +747,27 @@ class TcmAppointmentNotificationServiceImplTest
         verify(patientService, org.mockito.Mockito.never()).generateConsentToken(anyString());
     }
 
+    @Test
+    void bookedAndConfirmedAppointmentsReceiveCareOnScheduleWithoutManualCompletion()
+    {
+        ReflectionTestUtils.setField(service, "clock", java.time.Clock.fixed(java.time.Instant.parse("2026-10-16T17:00:00Z"), CLINIC_ZONE));
+        for (String status : Arrays.asList("booked", "confirmed")) {
+            TcmAppointment appt = appointment(status, "patient", null, null, null, "consultation", status,
+                    LocalDateTime.of(2026, 10, 13, 11, 0), "{}");
+            when(appointmentMapper.selectTcmAppointmentById(appt.getId())).thenReturn(appt);
+            when(appointmentMapper.selectTcmAppointmentList(any())).thenReturn(java.util.Collections.singletonList(appt));
+            when(patientService.selectTcmPatientById("patient")).thenReturn(patient("patient", "Scheduled", "qa@example.invalid", 1, "{}"));
+            service.processDueNotifications(); service.processDueNotifications();
+            assertEquals(status, appt.getStatus());
+            JSONObject payload = JSONObject.parseObject(appt.getPayload());
+            assertTrue(StringUtils.isNotBlank(payload.getString("aftercareEmailSentAt")));
+            assertTrue(StringUtils.isNotBlank(payload.getString("followUpEmailSentAt")));
+            assertTrue(StringUtils.isBlank(payload.getString("treatmentCompletedAt")));
+        }
+        verify(emailService, times(2)).sendTemplateAndLog(anyString(), eq("aftercare"), any(), anyString(), anyString(), anyString());
+        verify(emailService, times(2)).sendTemplateAndLog(anyString(), eq("followUp"), any(), anyString(), anyString(), anyString());
+    }
+
     private TcmPatient patient(String id, String name, String email, Integer consentSigned, String payload)
     {
         TcmPatient patient = new TcmPatient();
