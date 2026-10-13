@@ -99,7 +99,7 @@ public interface ITcmConsultationService
     /**
      * 按第三方支付结果幂等记录付款
      */
-    TcmConsultation recordProviderPayment(String id, String actorId, Map<String, Object> paymentInfo);
+    ProviderPaymentResult recordProviderPayment(String id, String actorId, Map<String, Object> paymentInfo);
 
     /**
      * 标记配药完成

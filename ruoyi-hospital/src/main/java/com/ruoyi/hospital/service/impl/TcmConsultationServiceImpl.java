@@ -33,6 +33,7 @@ import com.ruoyi.hospital.mapper.TcmConsultationModMapper;
 import com.ruoyi.hospital.mapper.TcmAppointmentMapper;
 import com.ruoyi.hospital.mapper.TcmPatientMapper;
 import com.ruoyi.hospital.service.ITcmConsultationService;
+import com.ruoyi.hospital.service.ProviderPaymentResult;
 import com.ruoyi.hospital.service.ITcmAppointmentNotificationService;
 import com.ruoyi.hospital.service.ITcmInventoryService;
 import com.ruoyi.hospital.service.ITcmPatientFileService;
@@ -945,7 +946,7 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
 
     @Override
     @Transactional(rollbackFor = Exception.class)
-    public TcmConsultation recordProviderPayment(String id, String actorId, Map<String, Object> paymentInfo)
+    public ProviderPaymentResult recordProviderPayment(String id, String actorId, Map<String, Object> paymentInfo)
     {
         TcmConsultation existing = consultationMapper.selectTcmConsultationForUpdate(id);
         if (existing == null)
@@ -970,7 +971,7 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
             if ((StringUtils.isNotBlank(sessionId) && sessionId.equals(record.getString("stripeSessionId")))
                     || (StringUtils.isNotBlank(paymentIntentId) && paymentIntentId.equals(record.getString("stripePaymentIntentId"))))
             {
-                return prepareConsultationView(existing);
+                return new ProviderPaymentResult(prepareConsultationView(existing), false);
             }
         }
 
@@ -981,7 +982,7 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         }
         if (amount.compareTo(BigDecimal.ZERO) <= 0)
         {
-            return prepareConsultationView(existing);
+            return new ProviderPaymentResult(prepareConsultationView(existing), false);
         }
 
         String operationTime = nowString();
@@ -1007,20 +1008,13 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         normalizePaymentState(payload);
         existing.setPayload(payload.toJSONString());
         consultationMapper.updateTcmConsultation(existing);
-        Map<String, String> invoice = pdfService.generateInvoice(id);
-        putIfPresent(payload, "invoicePdfUrl", invoice.get("url"));
-        putIfPresent(payload, "invoicePdfPath", invoice.get("filePath"));
-        payload.put("invoiceGeneratedAt", operationTime);
-        normalizePaymentState(payload);
-        existing.setPayload(payload.toJSONString());
-        consultationMapper.updateTcmConsultation(existing);
-
         String changeSummary = buildPaymentSummary(payload);
         appendPayloadModification(payload, "payment", "Stripe付款", actorId, changeSummary, operationTime);
         existing.setPayload(payload.toJSONString());
         consultationMapper.updateTcmConsultation(existing);
         insertConsultationMod(existing, actorId, "payment", "Stripe payment recorded", changeSummary, operationTime);
-        return prepareConsultationView(consultationMapper.selectTcmConsultationById(id));
+        return new ProviderPaymentResult(
+                prepareConsultationView(consultationMapper.selectTcmConsultationById(id)), true);
     }
 
     /**

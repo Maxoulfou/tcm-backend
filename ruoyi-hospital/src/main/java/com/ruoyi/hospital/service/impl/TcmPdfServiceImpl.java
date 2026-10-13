@@ -2258,23 +2258,40 @@ public class TcmPdfServiceImpl implements ITcmPdfService
 
     private void updateConsultationPdfMeta(TcmConsultation consultation, Map<String, String> result, String type)
     {
-        JSONObject payload = parsePayload(consultation.getPayload());
-        if ("report".equals(type))
+        // Rendering and cloud backup can overlap a payment or clinical edit.
+        // Merge only PDF metadata into the current payload with an atomic compare-and-set.
+        for (int attempt = 0; attempt < 3; attempt++)
         {
-            payload.put("reportPdfPath", result.get("filePath"));
-            payload.put("reportPdfUrl", result.get("url"));
-            payload.put("consultationPdfPath", result.get("filePath"));
-            payload.put("consultationPdfUrl", result.get("url"));
-            payload.put("reportPdfGeneratedAt", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
+            TcmConsultation current = consultationMapper.selectTcmConsultationById(consultation.getId());
+            if (current == null)
+            {
+                throw new ServiceException("consultation not found");
+            }
+            String expectedPayload = current.getPayload();
+            JSONObject payload = parsePayload(expectedPayload);
+            if ("report".equals(type))
+            {
+                payload.put("reportPdfPath", result.get("filePath"));
+                payload.put("reportPdfUrl", result.get("url"));
+                payload.put("consultationPdfPath", result.get("filePath"));
+                payload.put("consultationPdfUrl", result.get("url"));
+                payload.put("reportPdfGeneratedAt", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
+            }
+            else if ("invoice".equals(type))
+            {
+                payload.put("invoicePdfPath", result.get("filePath"));
+                payload.put("invoicePdfUrl", result.get("url"));
+                payload.put("invoicePdfGeneratedAt", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
+            }
+            TcmConsultation update = new TcmConsultation();
+            update.setId(consultation.getId());
+            update.setPayload(payload.toJSONString());
+            if (consultationMapper.updatePdfPayloadIfUnchanged(update, expectedPayload) == 1)
+            {
+                return;
+            }
         }
-        else if ("invoice".equals(type))
-        {
-            payload.put("invoicePdfPath", result.get("filePath"));
-            payload.put("invoicePdfUrl", result.get("url"));
-            payload.put("invoicePdfGeneratedAt", new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date()));
-        }
-        consultation.setPayload(payload.toJSONString());
-        consultationMapper.updateTcmConsultation(consultation);
+        throw new ServiceException("Consultation changed while saving PDF; please retry");
     }
 
     private void insertConsentFileRecord(TcmPatient patient, String resourcePath)

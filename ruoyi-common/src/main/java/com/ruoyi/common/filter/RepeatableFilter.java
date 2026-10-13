@@ -28,6 +28,16 @@ public class RepeatableFilter implements Filter
     public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
             throws IOException, ServletException
     {
+        if (request instanceof HttpServletRequest)
+        {
+            String path = ((HttpServletRequest) request).getServletPath();
+            // The generic repeatable wrapper removes line endings; signed webhooks need exact bytes.
+            if ("/api/stripe/webhook".equals(path) || "/api/stripe/webhook/".equals(path))
+            {
+                chain.doFilter(request, response);
+                return;
+            }
+        }
         ServletRequest requestWrapper = null;
         if (request instanceof HttpServletRequest
                 && StringUtils.startsWithIgnoreCase(request.getContentType(), MediaType.APPLICATION_JSON_VALUE))

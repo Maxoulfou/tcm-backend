@@ -1,6 +1,7 @@
 package com.ruoyi.hospital.controller;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -25,6 +26,7 @@ import com.ruoyi.hospital.domain.TcmPatient;
 import com.ruoyi.hospital.service.ITcmEmailLogService;
 import com.ruoyi.hospital.service.ITcmEmailService;
 import com.ruoyi.hospital.service.ITcmPatientService;
+import com.ruoyi.common.exception.ServiceException;
 
 @ExtendWith(MockitoExtension.class)
 class TcmEmailLogControllerTest
@@ -37,6 +39,20 @@ class TcmEmailLogControllerTest
 
     @Mock
     private ITcmPatientService patientService;
+
+    @Test
+    void resend_shouldRejectHistoricalAttachmentFailureWhoseReferenceWasLost()
+    {
+        TcmEmailLog source = new TcmEmailLog();
+        source.setId(41L);
+        source.setToEmail("qa@example.invalid");
+        source.setEmailType("invoice");
+        source.setPayload("{\"attachmentError\":true,\"attachmentCount\":0}");
+        when(emailLogService.selectTcmEmailLogById(41L)).thenReturn(source);
+
+        assertThrows(ServiceException.class, () -> buildController().resend(41L, null));
+        org.mockito.Mockito.verifyNoInteractions(emailService);
+    }
 
     @Test
     void resend_shouldUseLatestPatientEmailForPatientFacingTemplate()

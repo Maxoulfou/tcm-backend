@@ -1,6 +1,7 @@
 package com.ruoyi.hospital.mapper;
 
 import java.util.List;
+import org.apache.ibatis.annotations.Param;
 import com.ruoyi.hospital.domain.TcmConsultation;
 
 /**
@@ -51,6 +52,9 @@ public interface TcmConsultationMapper
      * @return 结果
      */
     int updateTcmConsultation(TcmConsultation tcmConsultation);
+
+    int updatePdfPayloadIfUnchanged(@Param("consultation") TcmConsultation consultation,
+            @Param("expectedPayload") String expectedPayload);
 
     int reactivateTcmConsultation(TcmConsultation tcmConsultation);
 

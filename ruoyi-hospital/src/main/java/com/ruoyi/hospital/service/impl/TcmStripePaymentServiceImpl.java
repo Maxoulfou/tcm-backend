@@ -15,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.RejectedExecutionException;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 import com.alibaba.fastjson2.JSON;
@@ -23,13 +24,16 @@ import com.alibaba.fastjson2.JSONObject;
 import com.ruoyi.common.exception.ServiceException;
 import com.ruoyi.common.utils.StringUtils;
 import com.ruoyi.hospital.domain.TcmConsultation;
+import com.ruoyi.hospital.domain.TcmEmailLog;
 import com.ruoyi.hospital.domain.TcmPatient;
 import com.ruoyi.hospital.mapper.TcmPatientMapper;
 import com.ruoyi.hospital.service.ITcmConsultationService;
 import com.ruoyi.hospital.service.ITcmEmailService;
+import com.ruoyi.hospital.service.ITcmEmailLogService;
 import com.ruoyi.hospital.service.ITcmPdfService;
 import com.ruoyi.hospital.service.ITcmSettingsService;
 import com.ruoyi.hospital.service.ITcmStripePaymentService;
+import com.ruoyi.hospital.service.ProviderPaymentResult;
 import com.ruoyi.hospital.utils.PayloadUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,6 +46,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
@@ -57,6 +62,7 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
             "payment_intent.succeeded",
             "payment_intent.payment_failed",
             "checkout.session.completed",
+            "checkout.session.async_payment_succeeded",
             "charge.refunded",
             "refund.created",
             "terminal.reader.action_succeeded",
@@ -70,6 +76,9 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
 
     @Autowired
     private ITcmEmailService emailService;
+
+    @Autowired
+    private ITcmEmailLogService emailLogService;
 
     @Autowired(required = false)
     private ITcmPdfService pdfService;
@@ -99,7 +108,15 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
     @Value("${tcm.instance-id:}")
     private String instanceId;
 
-    private final RestTemplate restTemplate = new RestTemplate();
+    private final RestTemplate restTemplate = createRestTemplate();
+
+    private static RestTemplate createRestTemplate()
+    {
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(5000);
+        factory.setReadTimeout(10000);
+        return new RestTemplate(factory);
+    }
 
     private String configuredStripeSecretKey()
     {
@@ -337,7 +354,6 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
         }
 
         String paymentIntentId = paymentIntent.getString("id");
-        boolean duplicatePayment = hasStripePaymentRecord(consultationId, null, paymentIntentId);
         BigDecimal amount = stripeAmountToMoney(paymentIntent.getLongValue("amount_received"));
         if (amount.compareTo(BigDecimal.ZERO) <= 0)
         {
@@ -354,10 +370,11 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
         paymentInfo.put("providerStatus", paymentIntent.getString("status"));
         paymentInfo.put("livemode", paymentIntent.getBooleanValue("livemode"));
 
-        TcmConsultation recorded = consultationService.recordProviderPayment(consultationId, "stripe_terminal", paymentInfo);
-        if (!duplicatePayment)
+        ProviderPaymentResult payment = consultationService.recordProviderPayment(consultationId, "stripe_terminal", paymentInfo);
+        TcmConsultation recorded = payment.getConsultation();
+        if (payment.isNewlyRecorded())
         {
-            sendInvoiceEmail(recorded, paymentInfo);
+            dispatchInvoiceEmail(recorded, paymentInfo);
         }
         return recorded;
     }
@@ -414,20 +431,21 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
     {
         String verifiedPayload = payload;
         String webhookSecret = configuredStripeWebhookSecret();
-        if (StringUtils.isNotBlank(webhookSecret))
+        if (StringUtils.isBlank(webhookSecret))
         {
-            try
+            throw new ServiceException("Stripe webhook secret is not configured");
+        }
+        try
+        {
+            verifySignature(payload, signatureHeader, webhookSecret);
+        }
+        catch (ServiceException e)
+        {
+            if (!isSignatureMismatch(e))
             {
-                verifySignature(payload, signatureHeader, webhookSecret);
+                throw e;
             }
-            catch (ServiceException e)
-            {
-                if (!isSignatureMismatch(e))
-                {
-                    throw e;
-                }
-                verifiedPayload = fetchStripeEventPayloadForSignatureFallback(payload, e);
-            }
+            verifiedPayload = fetchStripeEventPayloadForSignatureFallback(payload, e);
         }
         JSONObject event = parsePayload(verifiedPayload);
         String type = event.getString("type");
@@ -465,7 +483,8 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
             return ok(recorded != null, type);
         }
 
-        if (!"checkout.session.completed".equals(type))
+        if (!"checkout.session.completed".equals(type)
+                && !"checkout.session.async_payment_succeeded".equals(type))
         {
             return ok(false, type);
         }
@@ -475,6 +494,11 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
         if (session == null)
         {
             throw new ServiceException("Invalid Stripe webhook payload");
+        }
+        // Checkout completion can precede settlement for delayed payment methods.
+        if (!"paid".equals(session.getString("payment_status")))
+        {
+            return ok(false, type);
         }
         String consultationId = null;
         JSONObject metadata = session.getJSONObject("metadata");
@@ -501,12 +525,9 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
         paymentInfo.put("stripeEventId", event.getString("id"));
         paymentInfo.put("providerStatus", session.getString("payment_status"));
         paymentInfo.put("livemode", event.getBooleanValue("livemode"));
-        boolean duplicatePayment = hasStripePaymentRecord(
-                consultationId,
-                session.getString("id"),
-                session.getString("payment_intent"));
-        TcmConsultation recorded = consultationService.recordProviderPayment(consultationId, "stripe", paymentInfo);
-        if (!duplicatePayment)
+        ProviderPaymentResult payment = consultationService.recordProviderPayment(consultationId, "stripe", paymentInfo);
+        TcmConsultation recorded = payment.getConsultation();
+        if (payment.isNewlyRecorded())
         {
             dispatchInvoiceEmail(recorded, paymentInfo);
         }
@@ -579,33 +600,29 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
     }
     private void dispatchInvoiceEmail(TcmConsultation consultation, Map<String, Object> paymentInfo)
     {
-        stripeWebhookTaskExecutor.execute(() -> sendInvoiceEmail(consultation, paymentInfo));
-    }
-
-    private boolean hasStripePaymentRecord(String consultationId, String sessionId, String paymentIntentId)
-    {
-        TcmConsultation consultation = consultationService.selectTcmConsultationById(consultationId);
-        if (consultation == null)
+        try
         {
-            return false;
+            stripeWebhookTaskExecutor.execute(() -> sendInvoiceEmail(consultation, paymentInfo));
         }
-        JSONObject payload = parsePayload(consultation.getPayload());
-        JSONArray records = payload.getJSONArray("paymentRecords");
-        if (records == null)
+        catch (RejectedExecutionException e)
         {
-            return false;
-        }
-        for (int i = 0; i < records.size(); i++)
-        {
-            JSONObject record = records.getJSONObject(i);
-            if (record == null) continue;
-            if ((StringUtils.isNotBlank(sessionId) && sessionId.equals(record.getString("stripeSessionId")))
-                    || (StringUtils.isNotBlank(paymentIntentId) && paymentIntentId.equals(record.getString("stripePaymentIntentId"))))
+            log.error("Stripe invoice task rejected after payment commit: consultationId={}",
+                    consultation != null ? consultation.getId() : "", e);
+            try
             {
-                return true;
+                TcmPatient patient = consultation != null
+                        ? patientMapper.selectTcmPatientById(consultation.getPatientId()) : null;
+                if (patient != null && StringUtils.isNotBlank(patient.getEmail()))
+                {
+                    recordInvoicePreparationFailure(consultation, patient,
+                            buildInvoiceEmailVariables(consultation, patient, paymentInfo), e);
+                }
+            }
+            catch (Exception logError)
+            {
+                log.error("Could not persist failed Stripe invoice task", logError);
             }
         }
-        return false;
     }
 
     private void sendInvoiceEmail(TcmConsultation consultation, Map<String, Object> paymentInfo)
@@ -619,41 +636,31 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
             TcmPatient patient = patientMapper.selectTcmPatientById(consultation.getPatientId());
             if (patient == null || StringUtils.isBlank(patient.getEmail()))
             {
+                // The invoice is still available in the patient's file list without an email address.
+                generateInvoicePdf(consultation);
                 return;
             }
-            JSONObject payload = parsePayload(consultation.getPayload());
-            Map<String, String> invoicePdf = generateInvoicePdf(consultation);
-            String clinicName = normalizeClinicName(payload.getString("clinicName"));
-            String consultationNo = defaultText(consultation.getConsultationId(), consultation.getId());
-            String consultationDate = defaultText(consultation.getConsultDate(), "");
-            String currency = defaultText(stringValue(paymentInfo.get("currency")), defaultText(payload.getString("currency"), "CAD"));
-            BigDecimal amountValue = toBigDecimal(paymentInfo.get("amount"));
-            if (amountValue.compareTo(BigDecimal.ZERO) <= 0)
+            Map<String, Object> variables = buildInvoiceEmailVariables(consultation, patient, paymentInfo);
+            Map<String, String> invoicePdf;
+            try
             {
-                amountValue = toBigDecimal(payload.get("totalAmount"));
+                // PDF generation (including remote backup) belongs after the payment commit.
+                invoicePdf = generateInvoicePdf(consultation);
             }
-            String amount = currency.toUpperCase() + " " + amountValue.setScale(2, RoundingMode.HALF_UP).toPlainString();
-            String invoiceLink = "";
-
-            Map<String, Object> variables = new LinkedHashMap<>();
-            variables.put("clinicName", clinicName);
-            variables.put("patientId", defaultText(patient.getId(), ""));
-            variables.put("patientName", defaultText(resolvePatientFirstName(patient), "Patient"));
-            variables.put("patientEmail", defaultText(patient.getEmail(), ""));
-            variables.put("consultationId", consultationNo);
-            variables.put("consultationDate", consultationDate);
-            variables.put("appointmentDate", resolveAppointmentDate(consultationDate));
-            variables.put("amount", amount);
-            variables.put("invoiceLink", invoiceLink);
+            catch (Exception preparationError)
+            {
+                recordInvoicePreparationFailure(consultation, patient, variables, preparationError);
+                return;
+            }
 
             emailService.sendTemplateAndLog(
                     patient.getEmail(),
                     "invoice",
                     variables,
-                    clinicName + "｜发票 " + defaultText(stringValue(variables.get("appointmentDate")), ""),
+                    invoiceSubject(variables),
                     buildInvoiceFallbackBody(variables),
                     "invoice",
-                    buildInvoiceAttachments(consultation, invoicePdf, payload));
+                    buildInvoiceAttachments(consultation, invoicePdf, parsePayload(consultation.getPayload())));
         }
         catch (Exception e)
         {
@@ -662,21 +669,70 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
         }
     }
 
+    private Map<String, Object> buildInvoiceEmailVariables(TcmConsultation consultation, TcmPatient patient,
+            Map<String, Object> paymentInfo)
+    {
+        JSONObject payload = parsePayload(consultation.getPayload());
+        String consultationDate = defaultText(consultation.getConsultDate(), "");
+        String currency = defaultText(stringValue(paymentInfo.get("currency")), defaultText(payload.getString("currency"), "CAD"));
+        BigDecimal amount = toBigDecimal(paymentInfo.get("amount"));
+        if (amount.compareTo(BigDecimal.ZERO) <= 0) amount = toBigDecimal(payload.get("totalAmount"));
+        Map<String, Object> variables = new LinkedHashMap<>();
+        variables.put("clinicName", normalizeClinicName(payload.getString("clinicName")));
+        variables.put("patientId", defaultText(patient.getId(), ""));
+        variables.put("patientName", defaultText(resolvePatientFirstName(patient), "Patient"));
+        variables.put("patientEmail", defaultText(patient.getEmail(), ""));
+        variables.put("consultationId", defaultText(consultation.getConsultationId(), consultation.getId()));
+        variables.put("consultationDate", consultationDate);
+        variables.put("appointmentDate", resolveAppointmentDate(consultationDate));
+        variables.put("amount", currency.toUpperCase() + " " + amount.setScale(2, RoundingMode.HALF_UP).toPlainString());
+        variables.put("invoiceLink", "");
+        return variables;
+    }
+
+    private String invoiceSubject(Map<String, Object> variables)
+    {
+        return stringValue(variables.get("clinicName")) + "｜发票 "
+                + defaultText(stringValue(variables.get("appointmentDate")), "");
+    }
+
+    private void recordInvoicePreparationFailure(TcmConsultation consultation, TcmPatient patient,
+            Map<String, Object> variables, Exception error)
+    {
+        TcmEmailLog failed = new TcmEmailLog();
+        failed.setToEmail(patient.getEmail());
+        failed.setSubject(invoiceSubject(variables));
+        failed.setBody(buildInvoiceFallbackBody(variables));
+        failed.setEmailType("invoice");
+        JSONObject payload = new JSONObject();
+        payload.put("sent", false);
+        payload.put("attachmentError", true);
+        payload.put("attachmentCount", 0);
+        payload.put("templateKey", "invoice");
+        payload.put("variables", variables);
+        payload.put("invoiceGenerationFailed", true);
+        payload.put("invoiceConsultationId", consultation.getId());
+        payload.put("deliveryError", "Invoice PDF is not ready. Use Resend to regenerate it: "
+                + defaultText(error.getMessage(), error.getClass().getSimpleName()));
+        failed.setPayload(payload.toJSONString());
+        if (emailLogService.insertTcmEmailLog(failed) != 1)
+        {
+            throw new ServiceException("Could not persist failed invoice delivery");
+        }
+    }
+
     private Map<String, String> generateInvoicePdf(TcmConsultation consultation)
     {
         if (pdfService == null || consultation == null || StringUtils.isBlank(consultation.getId()))
         {
-            return new HashMap<>();
+            throw new ServiceException("Invoice PDF service is unavailable");
         }
-        try
+        Map<String, String> result = pdfService.generateInvoice(consultation.getId());
+        if (result == null || StringUtils.isBlank(defaultText(result.get("resource"), result.get("filePath"))))
         {
-            return pdfService.generateInvoice(consultation.getId());
+            throw new ServiceException("Invoice PDF generation returned no attachment");
         }
-        catch (Exception e)
-        {
-            log.warn("Stripe付款后生成发票PDF失败: consultationId={}, error={}", consultation.getId(), e.getMessage());
-            return new HashMap<>();
-        }
+        return result;
     }
 
     private String resolvePatientFirstName(TcmPatient patient)
@@ -824,8 +880,17 @@ public class TcmStripePaymentServiceImpl implements ITcmStripePaymentService
         {
             throw new ServiceException("Invalid Stripe-Signature");
         }
-        long signedAt = Long.parseLong(timestamp);
-        if (Math.abs(Instant.now().getEpochSecond() - signedAt) > 300)
+        long signedAt;
+        try
+        {
+            signedAt = Long.parseLong(timestamp);
+        }
+        catch (NumberFormatException e)
+        {
+            throw new ServiceException("Invalid Stripe-Signature timestamp");
+        }
+        long now = Instant.now().getEpochSecond();
+        if (signedAt < now - 300 || signedAt > now + 300)
         {
             throw new ServiceException("Expired Stripe webhook signature");
         }

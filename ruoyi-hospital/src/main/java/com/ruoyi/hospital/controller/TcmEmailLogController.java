@@ -16,6 +16,7 @@ import com.ruoyi.hospital.domain.TcmPatient;
 import com.ruoyi.hospital.service.ITcmEmailLogService;
 import com.ruoyi.hospital.service.ITcmEmailService;
 import com.ruoyi.hospital.service.ITcmPatientService;
+import com.ruoyi.hospital.service.ITcmPdfService;
 import com.ruoyi.hospital.util.EmailTemplateRegistry;
 import com.ruoyi.hospital.utils.PayloadUtils;
 
@@ -31,6 +32,9 @@ public class TcmEmailLogController
 
     @Autowired
     private ITcmPatientService patientService;
+
+    @Autowired
+    private ITcmPdfService pdfService;
 
     @PreAuthorize("@ss.hasRole('admin')")
     @GetMapping("")
@@ -131,6 +135,29 @@ public class TcmEmailLogController
         if (attachments.isEmpty())
         {
             attachments = resolveAttachments(payload);
+        }
+        if (payload.getBooleanValue("invoiceGenerationFailed") && attachments.isEmpty())
+        {
+            String consultationId = stringValue(payload.get("invoiceConsultationId"));
+            if (consultationId == null)
+            {
+                throw new ServiceException("The invoice's consultation is missing; generate the invoice from the consultation first.");
+            }
+            Map<String, String> invoice = pdfService.generateInvoice(consultationId);
+            String resource = invoice != null ? stringValue(invoice.get("resource")) : null;
+            if (resource == null && invoice != null) resource = stringValue(invoice.get("filePath"));
+            if (resource == null)
+            {
+                throw new ServiceException("Invoice PDF generation returned no attachment. Please retry.");
+            }
+            Map<String, Object> attachment = new HashMap<>();
+            attachment.put("resource", resource);
+            attachment.put("fileName", "invoice.pdf");
+            attachments.add(attachment);
+        }
+        if (payload.getBooleanValue("attachmentError") && attachments.isEmpty())
+        {
+            throw new ServiceException("The original attachment is unavailable. Attach the file before resending.");
         }
         boolean useTemplate = templateKey != null || Boolean.TRUE.equals(overrides.get("useTemplate"));
         to = resolveLatestPatientRecipient(to, type, templateKey, variables);

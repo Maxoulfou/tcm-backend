@@ -83,6 +83,7 @@ class TcmPdfServiceImplTest
         ReflectionTestUtils.setField(service, "hospitalFileStorage", hospitalFileStorage);
         ReflectionTestUtils.setField(service, "userService", userService);
         ReflectionTestUtils.setField(service, "patientFileService", patientFileService);
+        org.mockito.Mockito.lenient().when(consultationMapper.updatePdfPayloadIfUnchanged(any(), any())).thenReturn(1);
     }
 
     @Test
@@ -183,7 +184,7 @@ class TcmPdfServiceImplTest
         doAnswer(invocation -> {
             updatedConsultations.add(copyConsultation(invocation.getArgument(0)));
             return 1;
-        }).when(consultationMapper).updateTcmConsultation(any(TcmConsultation.class));
+        }).when(consultationMapper).updatePdfPayloadIfUnchanged(any(TcmConsultation.class), anyString());
 
         List<TcmPatientFile> insertedFiles = new ArrayList<>();
         doAnswer(invocation -> {
@@ -273,7 +274,7 @@ class TcmPdfServiceImplTest
         doAnswer(invocation -> {
             updatedConsultations.add(copyConsultation(invocation.getArgument(0)));
             return 1;
-        }).when(consultationMapper).updateTcmConsultation(any(TcmConsultation.class));
+        }).when(consultationMapper).updatePdfPayloadIfUnchanged(any(TcmConsultation.class), anyString());
 
         Map<String, String> result = service.generateConsultationReport("consult-existing");
 
@@ -377,7 +378,7 @@ class TcmPdfServiceImplTest
         doAnswer(invocation -> {
             updatedConsultations.add(copyConsultation(invocation.getArgument(0)));
             return 1;
-        }).when(consultationMapper).updateTcmConsultation(any(TcmConsultation.class));
+        }).when(consultationMapper).updatePdfPayloadIfUnchanged(any(TcmConsultation.class), anyString());
 
         Map<String, String> result = service.generateInvoice("consult-invoice");
 

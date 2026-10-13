@@ -119,6 +119,13 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         where id = #{id}
     </update>
 
+    <update id="updatePdfPayloadIfUnchanged">
+        update tcm_consultation set payload = #{consultation.payload}, update_time = sysdate()
+        where id = #{consultation.id}
+          and ((payload is null and #{expectedPayload} is null)
+            or cast(payload as binary) = cast(#{expectedPayload} as binary))
+    </update>
+
     <update id="reactivateTcmConsultation" parameterType="TcmConsultation">
         update tcm_consultation
         set status = #{status},

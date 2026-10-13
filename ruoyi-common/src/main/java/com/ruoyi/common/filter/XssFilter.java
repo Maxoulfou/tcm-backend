@@ -59,6 +59,11 @@ public class XssFilter implements Filter
     {
         String url = request.getServletPath();
         String method = request.getMethod();
+        // Stripe authenticates the original bytes; HTML escaping or trimming invalidates its signature.
+        if ("/api/stripe/webhook".equals(url) || "/api/stripe/webhook/".equals(url))
+        {
+            return true;
+        }
         // GET DELETE 不过滤
         if (method == null || HttpMethod.GET.matches(method) || HttpMethod.DELETE.matches(method))
         {

@@ -25,6 +25,7 @@ import com.ruoyi.hospital.mapper.TcmPatientMapper;
 import com.ruoyi.hospital.service.ITcmConsultationService;
 import com.ruoyi.hospital.service.ITcmEmailService;
 import com.ruoyi.hospital.service.ITcmSettingsService;
+import com.ruoyi.hospital.service.ProviderPaymentResult;
 
 @ExtendWith(MockitoExtension.class)
 class TcmStripePaymentServiceImplTest
@@ -51,22 +52,19 @@ class TcmStripePaymentServiceImplTest
         ReflectionTestUtils.setField(service, "patientMapper", patientMapper);
         ReflectionTestUtils.setField(service, "emailService", emailService);
         ReflectionTestUtils.setField(service, "settingsService", settingsService);
-        when(settingsService.getStripeWebhookSecret()).thenReturn("");
+        when(settingsService.getStripeWebhookSecret()).thenReturn("whsec_test");
     }
 
     @Test
     void handleWebhook_shouldRecordTerminalPaymentIntentSucceeded()
     {
-        TcmConsultation existing = new TcmConsultation();
-        existing.setId("consult-1");
-        existing.setPayload("{\"paymentRecords\":[]}");
         TcmConsultation recorded = new TcmConsultation();
         recorded.setId("consult-1");
         recorded.setPayload("{}");
 
-        when(consultationService.selectTcmConsultationById("consult-1")).thenReturn(existing);
+
         when(consultationService.recordProviderPayment(eq("consult-1"), eq("stripe_terminal"), anyMap()))
-                .thenReturn(recorded);
+                .thenReturn(new ProviderPaymentResult(recorded, true));
         when(settingsService.getStripeTerminalReaderId()).thenReturn("tmr_reader");
 
         String payload = "{"
@@ -84,7 +82,7 @@ class TcmStripePaymentServiceImplTest
                 + "}}"
                 + "}";
 
-        Map<String, Object> result = service.handleWebhook(payload, "");
+        Map<String, Object> result = service.handleWebhook(payload, sign(payload));
 
         assertTrue((Boolean) result.get("received"));
         assertTrue((Boolean) result.get("processed"));
@@ -114,7 +112,7 @@ class TcmStripePaymentServiceImplTest
                 + "\"data\":{\"object\":{\"id\":\"tmr_reader\"}}"
                 + "}";
 
-        Map<String, Object> result = service.handleWebhook(payload, "");
+        Map<String, Object> result = service.handleWebhook(payload, sign(payload));
 
         assertTrue((Boolean) result.get("received"));
         assertFalse((Boolean) result.get("processed"));
@@ -157,9 +155,6 @@ class TcmStripePaymentServiceImplTest
         ReflectionTestUtils.setField(fallbackService, "emailService", emailService);
         ReflectionTestUtils.setField(fallbackService, "settingsService", settingsService);
 
-        TcmConsultation existing = new TcmConsultation();
-        existing.setId("consult-1");
-        existing.setPayload("{\"paymentRecords\":[]}");
         TcmConsultation recorded = new TcmConsultation();
         recorded.setId("consult-1");
         recorded.setPayload("{}");
@@ -167,9 +162,9 @@ class TcmStripePaymentServiceImplTest
         when(settingsService.getStripeWebhookSecret()).thenReturn("whsec_test");
         when(settingsService.getStripeSecretKey()).thenReturn("sk_live_test");
         when(settingsService.getStripeTerminalReaderId()).thenReturn("tmr_reader");
-        when(consultationService.selectTcmConsultationById("consult-1")).thenReturn(existing);
+
         when(consultationService.recordProviderPayment(eq("consult-1"), eq("stripe_terminal"), anyMap()))
-                .thenReturn(recorded);
+                .thenReturn(new ProviderPaymentResult(recorded, true));
 
         String payload = "{"
                 + "\"id\":\"evt_api_verified\","
@@ -207,9 +202,9 @@ class TcmStripePaymentServiceImplTest
                     + "\"metadata\":{\"consultationId\":\"consult-1\"}}}}";
             String clone = legacy.replace("\"consultationId\"", "\"tcmInstance\":\"yuanyuan\",\"consultationId\"");
             ReflectionTestUtils.setField(service, "instanceId", "yuanyuan");
-            assertFalse((Boolean) service.handleWebhook(legacy, "").get("processed"));
+            assertFalse((Boolean) service.handleWebhook(legacy, sign(legacy)).get("processed"));
             ReflectionTestUtils.setField(service, "instanceId", "");
-            assertFalse((Boolean) service.handleWebhook(clone, "").get("processed"));
+            assertFalse((Boolean) service.handleWebhook(clone, sign(clone)).get("processed"));
         }
         org.mockito.Mockito.verifyNoInteractions(consultationService, patientMapper, emailService);
     }
@@ -218,10 +213,12 @@ class TcmStripePaymentServiceImplTest
     void handleWebhook_shouldProcessCheckoutForItsOwnInstance()
     {
         ReflectionTestUtils.setField(service, "instanceId", "yuanyuan");
+        when(consultationService.recordProviderPayment(eq("consult-1"), eq("stripe"), anyMap()))
+                .thenReturn(new ProviderPaymentResult(null, false));
         String payload = "{\"id\":\"evt_clone\",\"type\":\"checkout.session.completed\","
-                + "\"data\":{\"object\":{\"id\":\"cs_clone\",\"amount_total\":1234,"
+                + "\"data\":{\"object\":{\"id\":\"cs_clone\",\"amount_total\":1234,\"payment_status\":\"paid\","
                 + "\"metadata\":{\"consultationId\":\"consult-1\",\"tcmInstance\":\"yuanyuan\"}}}}";
-        assertTrue((Boolean) service.handleWebhook(payload, "").get("processed"));
+        assertTrue((Boolean) service.handleWebhook(payload, sign(payload)).get("processed"));
         verify(consultationService).recordProviderPayment(eq("consult-1"), eq("stripe"), anyMap());
     }
 
@@ -239,6 +236,13 @@ class TcmStripePaymentServiceImplTest
         org.junit.jupiter.api.Assertions.assertThrows(com.ruoyi.common.exception.ServiceException.class,
                 () -> isolated.getTerminalPaymentStatus("consult-1", "pi_foreign"));
         org.mockito.Mockito.verifyNoInteractions(consultationService, emailService);
+    }
+
+    private String sign(String payload)
+    {
+        long timestamp = System.currentTimeMillis() / 1000L;
+        String signature = ReflectionTestUtils.invokeMethod(service, "hmacSha256", timestamp + "." + payload, "whsec_test");
+        return "t=" + timestamp + ",v1=" + signature;
     }
 
     private static class StripeEventFallbackService extends TcmStripePaymentServiceImpl

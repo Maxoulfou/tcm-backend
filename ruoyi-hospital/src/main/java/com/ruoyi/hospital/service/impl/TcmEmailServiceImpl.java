@@ -117,7 +117,7 @@ public class TcmEmailServiceImpl implements ITcmEmailService
         String safeSubject = subject != null ? subject : "";
         List<EmailAttachment> resolvedAttachments = resolveAttachments(attachments);
         boolean requestedAttachments = attachments != null && !attachments.isEmpty();
-        boolean attachmentError = requestedAttachments && resolvedAttachments.isEmpty();
+        boolean attachmentError = requestedAttachments && resolvedAttachments.size() != attachments.size();
         String safeBody = prepareBodyForAttachments(body != null ? body : "", type, !resolvedAttachments.isEmpty());
         String htmlBody = buildHtmlEmail(safeBody);
 
@@ -178,9 +178,11 @@ public class TcmEmailServiceImpl implements ITcmEmailService
         {
             payload.put("deliveryError", deliveryError);
         }
-        if (!resolvedAttachments.isEmpty())
+        if (requestedAttachments)
         {
-            payload.put("attachments", toAttachmentPayload(resolvedAttachments));
+            // A retry must retain every requested file, including a currently missing one.
+            // Otherwise a failed invoice could be resent successfully without its attachment.
+            payload.put("attachments", attachmentError ? attachments : toAttachmentPayload(resolvedAttachments));
         }
         if (payloadExtras != null)
         {
