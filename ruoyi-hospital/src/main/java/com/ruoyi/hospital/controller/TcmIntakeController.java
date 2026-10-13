@@ -98,24 +98,8 @@ public class TcmIntakeController
                 throw new ServiceException("该表单已提交");
             }
 
-            // 将表单数据存入 payload 的 intakeFormData 字段
-            String payloadStr = appt.getPayload();
-            JSONObject payload;
-            if (payloadStr != null && !payloadStr.isEmpty())
-            {
-                try { payload = JSON.parseObject(payloadStr); }
-                catch (Exception e) { payload = new JSONObject(); }
-            }
-            else
-            {
-                payload = new JSONObject();
-            }
-            payload.put("intakeFormData", formData);
-            appt.setPayload(payload.toJSONString());
-            appt.setIntakeSubmitted(1);
-            appt.setIntakeToken(null);
-            appointmentService.updateTcmAppointment(appt);
-            patientService.saveLatestIntakeForm(appt.getPatientId(), formData);
+            TcmAppointment submitted = appointmentService.completeIntake(appt.getId(), token, formData);
+            patientService.saveLatestIntakeForm(submitted.getPatientId(), formData);
 
             Map<String, Object> result = new HashMap<>();
             result.put("ok", true);

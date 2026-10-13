@@ -73,6 +73,8 @@ class TcmConsultationServiceImplTest
         service = new TcmConsultationServiceImpl();
         org.mockito.Mockito.lenient().when(consultationMapper.selectTcmConsultationForUpdate(anyString()))
                 .thenAnswer(invocation -> consultationMapper.selectTcmConsultationById(invocation.getArgument(0)));
+        org.mockito.Mockito.lenient().when(appointmentMapper.selectTcmAppointmentForUpdate(anyString()))
+                .thenAnswer(invocation -> appointmentMapper.selectTcmAppointmentById(invocation.getArgument(0)));
         ReflectionTestUtils.setField(service, "consultationMapper", consultationMapper);
         ReflectionTestUtils.setField(service, "modMapper", modMapper);
         ReflectionTestUtils.setField(service, "pdfService", pdfService);
@@ -204,6 +206,45 @@ class TcmConsultationServiceImplTest
         verify(appointmentMapper).updateTcmAppointment(appointment);
         verify(appointmentMapper, never()).selectTcmAppointmentList(any(TcmAppointment.class));
         verify(appointmentNotificationService).handleAppointmentStatusChanged(any(TcmAppointment.class), eq(appointment));
+    }
+
+    @Test
+    void completeConsultationKeepsNotificationMetadataWrittenAfterAppointmentWasResolved()
+    {
+        TcmConsultation existing = consultation("latest-appointment", JSONObject.of("appointmentId", "linked"));
+        existing.setStatus("draft");
+        TcmAppointment snapshot = appointment("linked", "2026-04-06 10:00:00", "doctor-1");
+        TcmAppointment latest = appointment("linked", "2026-04-06 10:00:00", "doctor-1");
+        latest.setPayload("{\"aftercareEmailSentAt\":\"2026-04-06 12:00:00\"}");
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        when(appointmentMapper.selectTcmAppointmentById("linked")).thenReturn(snapshot, latest);
+        when(appointmentMapper.selectTcmAppointmentForUpdate("linked")).thenReturn(latest);
+
+        service.completeConsultation(existing.getId(), "doctor-1");
+
+        assertEquals("completed", latest.getStatus());
+        assertEquals("2026-04-06 12:00:00", JSON.parseObject(latest.getPayload()).getString("aftercareEmailSentAt"));
+        verify(appointmentMapper).updateTcmAppointment(latest);
+        verify(appointmentMapper, never()).updateTcmAppointment(snapshot);
+    }
+
+    @Test
+    void completeConsultationDoesNotReopenAnAppointmentCancelledAfterItWasResolved()
+    {
+        TcmConsultation existing = consultation("cancelled-appointment", JSONObject.of("appointmentId", "linked"));
+        existing.setStatus("draft");
+        TcmAppointment snapshot = appointment("linked", "2026-04-06 10:00:00", "doctor-1");
+        TcmAppointment latest = appointment("linked", "2026-04-06 10:00:00", "doctor-1");
+        latest.setStatus("cancelled");
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        when(appointmentMapper.selectTcmAppointmentById("linked")).thenReturn(snapshot);
+        when(appointmentMapper.selectTcmAppointmentForUpdate("linked")).thenReturn(latest);
+
+        service.completeConsultation(existing.getId(), "doctor-1");
+
+        assertEquals("cancelled", latest.getStatus());
+        verify(appointmentMapper, never()).updateTcmAppointment(any());
+        verify(appointmentNotificationService, never()).handleAppointmentStatusChanged(any(), any());
     }
 
     @Test
@@ -645,6 +686,60 @@ class TcmConsultationServiceImplTest
         service.updateTcmConsultation(incoming, "qa");
         assertEquals("70", JSON.parseObject(incoming.getPayload()).getJSONArray("prescriptions").getJSONObject(0)
                 .getJSONArray("inventoryReservation").getJSONObject(0).getString("reservedQty"));
+        org.mockito.Mockito.verifyNoInteractions(inventoryService);
+    }
+
+    @Test
+    void fullSaveCannotChangeDispensedStockEvenWhenClientSendsEditingStatus()
+    {
+        TcmConsultation existing = consultation("dispensed-save", payloadWithPrescription(prescription("rx",
+                items(item("黄芪", "10", "g", "stock", null, "70")), reservations(reservation("stock", "黄芪", "70", null)), "dispensed")));
+        existing.setStatus("draft");
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        TcmConsultation incoming = consultation(existing.getId(), payloadWithPrescription(prescription("rx",
+                items(item("黄芪", "11", "g", "stock", null, "77")), new ArrayList<>(), "editing")));
+        incoming.setStatus("draft");
+
+        assertThrows(ServiceException.class, () -> service.updateTcmConsultation(incoming, "qa"));
+        verify(consultationMapper, never()).updateTcmConsultation(any());
+        org.mockito.Mockito.verifyNoInteractions(inventoryService);
+    }
+
+    @Test
+    void fullSaveCannotRemoveDispensedPrescription()
+    {
+        TcmConsultation existing = consultation("dispensed-remove", payloadWithPrescription(prescription("rx",
+                items(item("黄芪", "10", "g", "stock", null, "70")), reservations(reservation("stock", "黄芪", "70", null)), "dispensed")));
+        existing.setStatus("draft");
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        TcmConsultation incoming = consultation(existing.getId(), new JSONObject());
+        incoming.setStatus("draft");
+
+        assertThrows(ServiceException.class, () -> service.updateTcmConsultation(incoming, "qa"));
+        verify(consultationMapper, never()).updateTcmConsultation(any());
+        org.mockito.Mockito.verifyNoInteractions(inventoryService);
+    }
+
+    @Test
+    void fullSaveCanUpdateNotesWithUnchangedDispensedStockAndRefreshedMetadata()
+    {
+        TcmConsultation existing = consultation("dispensed-notes", payloadWithPrescription(prescription("rx",
+                items(item("黄芪", "10", "g", "stock", null, "70")), reservations(reservation("stock", "黄芪", "70", null)), "dispensed")));
+        existing.setStatus("draft");
+        when(consultationMapper.selectTcmConsultationById(existing.getId())).thenReturn(existing);
+        when(consultationMapper.updateTcmConsultation(any())).thenReturn(1);
+        JSONObject payload = payloadWithPrescription(prescription("rx",
+                items(item("黄芪 / Huang Qi", "10.0", "g", "stock", "refreshed-supplier", "70.00")), new ArrayList<>(), "editing"));
+        payload.put("chiefComplaint", "Updated notes");
+        TcmConsultation incoming = consultation(existing.getId(), payload);
+        incoming.setStatus("draft");
+
+        assertEquals(1, service.updateTcmConsultation(incoming, "qa"));
+        JSONObject saved = JSON.parseObject(incoming.getPayload());
+        assertEquals("Updated notes", saved.getString("chiefComplaint"));
+        assertEquals("dispensed", saved.getJSONArray("prescriptions").getJSONObject(0).getString("rxStatus"));
+        assertEquals("70", saved.getJSONArray("prescriptions").getJSONObject(0).getJSONArray("inventoryReservation")
+                .getJSONObject(0).getString("reservedQty"));
         org.mockito.Mockito.verifyNoInteractions(inventoryService);
     }
 

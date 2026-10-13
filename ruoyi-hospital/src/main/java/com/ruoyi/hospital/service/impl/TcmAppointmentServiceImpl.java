@@ -22,6 +22,7 @@ import java.util.Objects;
 import java.util.Set;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import com.alibaba.fastjson2.JSON;
 import com.alibaba.fastjson2.JSONObject;
 import com.ruoyi.common.core.domain.entity.SysRole;
@@ -94,15 +95,21 @@ public class TcmAppointmentServiceImpl implements ITcmAppointmentService
             ensureSlotAvailable(appointment, null);
         }
         appointment.setCreateTime(DateUtils.getNowDate());
+        preserveNotificationMetadata(new TcmAppointment(), appointment);
         return appointmentMapper.insertTcmAppointment(appointment);
     }
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public int updateTcmAppointment(TcmAppointment appointment)
     {
         TcmAppointment existing = appointment != null && appointment.getId() != null
-                ? appointmentMapper.selectTcmAppointmentById(appointment.getId())
+                ? appointmentMapper.selectTcmAppointmentForUpdate(appointment.getId())
                 : null;
+        if (existing == null)
+        {
+            throw new ServiceException("appointment not found");
+        }
         if (isTimeBlock(appointment))
         {
             validateTimeBlockFields(appointment);
@@ -112,17 +119,87 @@ public class TcmAppointmentServiceImpl implements ITcmAppointmentService
             prepareAppointmentScheduling(appointment, appointment.getId());
             ensureSlotAvailable(appointment, appointment.getId());
         }
+        preserveNotificationMetadata(existing, appointment);
         return appointmentMapper.updateTcmAppointment(appointment);
     }
 
+    private void preserveNotificationMetadata(TcmAppointment existing, TcmAppointment incoming)
+    {
+        if (existing == null || incoming == null || incoming.getPayload() == null) return;
+        JSONObject persisted = notificationPayload(existing.getPayload());
+        JSONObject merged = new JSONObject(persisted);
+        JSONObject requested = notificationPayload(incoming.getPayload());
+        merged.putAll(requested);
+        Set<String> protectedKeys = new LinkedHashSet<>(Arrays.asList("manageToken", "notificationOwnerInstance",
+                "treatmentCompletedAt", "cancelledAt", "cancellationSource", "changeEmailEvent", "notificationOutbox"));
+        for (String key : Arrays.asList("confirmationEmailSentAt", "reminderEmailSentAt", "aftercareEmailSentAt",
+                "followUpEmailSentAt", "changeEmailSentAt", "cancelEmailSentAt", "internalBookingEmailSentAt"))
+        {
+            protectedKeys.add(key);
+            protectedKeys.add(key + "PendingAt");
+            protectedKeys.add(key + "PendingToken");
+            protectedKeys.add(key + "FailedAt");
+            protectedKeys.add(key + "Event");
+        }
+        // A form opened before the scheduler ran must not erase or revive its delivery state.
+        for (String key : protectedKeys)
+        {
+            if (persisted.containsKey(key)) merged.put(key, persisted.get(key));
+            else merged.remove(key);
+        }
+        incoming.setPayload(merged.toJSONString());
+    }
+
+    private JSONObject notificationPayload(String value)
+    {
+        try
+        {
+            JSONObject parsed = JSON.parseObject(value);
+            return parsed != null ? parsed : new JSONObject();
+        }
+        catch (RuntimeException ignored)
+        {
+            return new JSONObject();
+        }
+    }
+
     @Override
+    @Transactional(rollbackFor = Exception.class)
+    public TcmAppointment completeIntake(String id, String expectedToken, Map<String, Object> formData)
+    {
+        TcmAppointment latest = appointmentMapper.selectTcmAppointmentForUpdate(id);
+        if (latest == null || expectedToken == null || expectedToken.trim().isEmpty()
+                || !expectedToken.equals(latest.getIntakeToken()) || Integer.valueOf(1).equals(latest.getIntakeSubmitted()))
+        {
+            throw new ServiceException("该表单已提交或链接已失效");
+        }
+        TcmAppointment consumed = new TcmAppointment();
+        consumed.setIntakeSubmitted(1);
+        if (appointmentMapper.updateNotificationIntake(consumed, latest) != 1)
+        {
+            throw new ServiceException("预约已变更，请重新打开表单");
+        }
+        JSONObject payload = notificationPayload(latest.getPayload());
+        payload.put("intakeFormData", formData);
+        latest.setIntakeToken(null);
+        latest.setIntakeSubmitted(1);
+        latest.setPayload(payload.toJSONString());
+        if (appointmentMapper.updateTcmAppointment(latest) != 1)
+        {
+            throw new ServiceException("问诊表单保存失败");
+        }
+        return latest;
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
     public TcmAppointment updateStatus(String id, String status)
     {
         if (!VALID_STATUSES.contains(status))
         {
             throw new ServiceException("invalid appointment status: " + status);
         }
-        TcmAppointment existing = appointmentMapper.selectTcmAppointmentById(id);
+        TcmAppointment existing = appointmentMapper.selectTcmAppointmentForUpdate(id);
         if (existing == null)
         {
             throw new ServiceException("appointment not found");

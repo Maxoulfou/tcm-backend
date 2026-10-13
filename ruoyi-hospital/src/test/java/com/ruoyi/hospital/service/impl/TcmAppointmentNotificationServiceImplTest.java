@@ -87,6 +87,9 @@ class TcmAppointmentNotificationServiceImplTest
         ReflectionTestUtils.setField(service, "clinicSettingMapper", clinicSettingMapper);
         ReflectionTestUtils.setField(service, "userMapper", userMapper);
         ReflectionTestUtils.setField(service, "publicAppBaseUrl", "http://test.local");
+        lenient().when(appointmentMapper.updateNotificationPayload(any(), any())).thenReturn(1);
+        lenient().when(appointmentMapper.updateNotificationIntake(any(), any())).thenReturn(1);
+        lenient().when(appointmentMapper.cancelNotificationAppointment(any(), any())).thenReturn(1);
         lenient().when(emailService.sendTemplateAndLog(anyString(), anyString(), any(), anyString(), anyString(), anyString())).thenReturn(true);
     }
 
@@ -108,7 +111,7 @@ class TcmAppointmentNotificationServiceImplTest
         doAnswer(invocation -> {
             stored.set(invocation.getArgument(0));
             return 1;
-        }).when(appointmentMapper).updateTcmAppointment(any(TcmAppointment.class));
+        }).when(appointmentMapper).updateNotificationPayload(any(TcmAppointment.class), any(TcmAppointment.class));
 
         TcmPatient patient = patient("pat-1", "张三", "patient@example.com", 0, "{}");
         when(patientService.selectTcmPatientById("pat-1")).thenReturn(patient);
@@ -214,7 +217,7 @@ class TcmAppointmentNotificationServiceImplTest
         doAnswer(invocation -> {
             stored.set(invocation.getArgument(0));
             return 1;
-        }).when(appointmentMapper).updateTcmAppointment(any(TcmAppointment.class));
+        }).when(appointmentMapper).updateNotificationPayload(any(TcmAppointment.class), any(TcmAppointment.class));
 
         TcmPatient patient = patient("pat-2", "李四", "change@example.com", 1,
                 "{\"latestIntakeCompleted\":true,\"latestIntakeSource\":\"public_intake_form\"}");
@@ -275,7 +278,7 @@ class TcmAppointmentNotificationServiceImplTest
         doAnswer(invocation -> {
             stored.set(invocation.getArgument(0));
             return 1;
-        }).when(appointmentMapper).updateTcmAppointment(any(TcmAppointment.class));
+        }).when(appointmentMapper).updateNotificationPayload(any(TcmAppointment.class), any(TcmAppointment.class));
 
         TcmPatient patient = patient("pat-3", "王五", "cancel@example.com", 1, "{}");
         when(patientService.selectTcmPatientById("pat-3")).thenReturn(patient);
@@ -335,7 +338,7 @@ class TcmAppointmentNotificationServiceImplTest
         doAnswer(invocation -> {
             stored.set(invocation.getArgument(0));
             return 1;
-        }).when(appointmentMapper).updateTcmAppointment(any(TcmAppointment.class));
+        }).when(appointmentMapper).updateNotificationPayload(any(TcmAppointment.class), any(TcmAppointment.class));
 
         TcmPatient patient = patient("pat-4", "赵六", "aftercare@example.com", 1, "{}");
         when(patientService.selectTcmPatientById("pat-4")).thenReturn(patient);
@@ -676,6 +679,41 @@ class TcmAppointmentNotificationServiceImplTest
                 argThat(variables -> newStart.equals(variables.get("appointmentStartTime"))), anyString(), anyString(), eq("appointment_reminder"));
         verify(emailService, times(1)).sendTemplateAndLog(anyString(), eq("reminder"), any(), anyString(), anyString(), anyString());
         assertTrue(StringUtils.isNotBlank(JSONObject.parseObject(appointment.getPayload()).getString("reminderEmailSentAt")));
+    }
+
+    @Test
+    void eachRealRescheduleSendsChangeNoticeWhileRepeatedSameEventIsDeduplicated()
+    {
+        LocalDateTime start = LocalDateTime.of(2026, 10, 20, 10, 0);
+        TcmAppointment current = appointment("repeat-change", "patient", null, null, null, "consultation", "booked",
+                start, "{\"manageToken\":\"change-token\",\"changeEmailSentAt\":\"2026-10-01 09:00:00\"}");
+        when(appointmentMapper.selectTcmAppointmentById(current.getId())).thenReturn(current);
+        when(patientService.selectTcmPatientById("patient"))
+                .thenReturn(patient("patient", "Change", "qa@example.invalid", 1, "{}"));
+        // Include returning to the original time and then repeating a past transition.
+        for (int hour : new int[] { 11, 12, 10, 11 })
+        {
+            TcmAppointment before = appointment(current.getId(), "patient", null, null, null, "consultation", "booked",
+                    LocalDateTime.parse(current.getStartTime(), MYSQL_DATETIME), current.getPayload());
+            current.setStartTime(start.withHour(hour).format(MYSQL_DATETIME));
+            current.setEndTime(start.withHour(hour + 1).format(MYSQL_DATETIME));
+            service.handleAppointmentUpdated(before, current);
+            service.handleAppointmentUpdated(before, current);
+        }
+        verify(emailService, times(4)).sendTemplateAndLog(anyString(), eq("appointmentChange"), any(), anyString(), anyString(), eq("appointment_change"));
+    }
+
+    @Test
+    void staleRescheduleCallbackCannotSendNoticeForAnOlderAppointmentTime()
+    {
+        LocalDateTime start = LocalDateTime.of(2026, 10, 20, 10, 0);
+        TcmAppointment before = appointment("stale-change", "patient", null, null, null, "consultation", "booked", start,
+                "{\"manageToken\":\"change-token\"}");
+        TcmAppointment after = appointment(before.getId(), "patient", null, null, null, "consultation", "booked", start.plusHours(1), before.getPayload());
+        TcmAppointment latest = appointment(before.getId(), "patient", null, null, null, "consultation", "booked", start.plusHours(2), before.getPayload());
+        when(appointmentMapper.selectTcmAppointmentById(before.getId())).thenReturn(latest);
+        service.handleAppointmentUpdated(before, after);
+        org.mockito.Mockito.verifyNoInteractions(emailService);
     }
 
     private TcmAppointment appointment(String id, String patientId, String branchId, String practitionerId,

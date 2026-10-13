@@ -24,6 +24,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
+import com.alibaba.fastjson2.JSONObject;
 import com.ruoyi.common.exception.ServiceException;
 import com.ruoyi.hospital.domain.TcmAppointment;
 import com.ruoyi.hospital.domain.TcmClinicSetting;
@@ -193,7 +194,7 @@ class TcmAppointmentServiceImplTest
         when(serviceTypeMapper.selectTcmServiceTypeByKey("acupuncture_new")).thenReturn(serviceType("acupuncture_new", 60));
         TcmAppointment existing = appointment("a-2", "101", "2026-04-06 09:00:00", "2026-04-06 10:00:00");
         existing.setServiceType("acupuncture_new");
-        when(appointmentMapper.selectTcmAppointmentById("a-2")).thenReturn(existing);
+        when(appointmentMapper.selectTcmAppointmentForUpdate("a-2")).thenReturn(existing);
 
         TcmAppointment updated = appointment("a-2", "101", "2026-04-06 10:30:00", "2026-04-06 10:00:00");
         updated.setServiceType("acupuncture_new");
@@ -240,7 +241,7 @@ class TcmAppointmentServiceImplTest
     {
         TcmAppointment existing = appointment("a-2", "p-2", "2026-03-28 09:00:00", "2026-03-28 09:30:00");
         existing.setRoomId("room-1");
-        when(appointmentMapper.selectTcmAppointmentById("a-2")).thenReturn(existing);
+        when(appointmentMapper.selectTcmAppointmentForUpdate("a-2")).thenReturn(existing);
 
         TcmAppointment updated = appointment("a-2", "p-2", "2026-03-28 09:00:00", "2026-03-28 09:30:00");
         updated.setRoomId("room-1");
@@ -254,6 +255,117 @@ class TcmAppointmentServiceImplTest
         verify(appointmentMapper).updateTcmAppointment(updated);
         verify(appointmentMapper, never()).selectOverlappingAppointments(anyString(), any(), anyString(), anyString(), any());
         verify(appointmentMapper, never()).selectTcmAppointmentList(any());
+    }
+
+    @Test
+    void staleAppointmentFormCannotEraseOrReviveServerNotificationState()
+    {
+        TcmAppointment existing = appointment("notification-state", "p-2", "2026-03-28 09:00:00", "2026-03-28 09:30:00");
+        existing.setPayload("{\"manageToken\":\"server-token\",\"aftercareEmailSentAt\":\"2026-03-28 10:30:00\","
+                + "\"followUpEmailSentAtPendingToken\":\"server-claim\",\"followUpEmailSentAtPendingAt\":\"2026-03-31 09:30:00\","
+                + "\"notificationOwnerInstance\":\"local\",\"changeEmailEvent\":\"server-change\",\"notes\":\"old\","
+                + "\"notificationOutbox\":{\"followUpEmailSentAt\":{\"event\":\"current-event\"}},"
+                + "\"aftercareEmailSentAtEvent\":\"delivered-event\"}");
+        when(appointmentMapper.selectTcmAppointmentForUpdate(existing.getId())).thenReturn(existing);
+        TcmAppointment updated = appointment(existing.getId(), "p-2", existing.getStartTime(), existing.getEndTime());
+        updated.setPayload("{\"manageToken\":\"old-token\",\"aftercareEmailSentAt\":null,\"followUpEmailSentAt\":\"fake-sent\","
+                + "\"reminderEmailSentAtPendingToken\":\"expired-claim\",\"changeEmailEvent\":\"old-change\",\"notes\":\"new\","
+                + "\"notificationOutbox\":{},\"aftercareEmailSentAtEvent\":\"old-event\"}");
+        when(appointmentMapper.updateTcmAppointment(updated)).thenReturn(1);
+        service.updateTcmAppointment(updated);
+        JSONObject saved = JSONObject.parseObject(updated.getPayload());
+        assertEquals("server-token", saved.getString("manageToken"));
+        assertEquals("2026-03-28 10:30:00", saved.getString("aftercareEmailSentAt"));
+        assertEquals("server-claim", saved.getString("followUpEmailSentAtPendingToken"));
+        assertEquals("2026-03-31 09:30:00", saved.getString("followUpEmailSentAtPendingAt"));
+        assertEquals("local", saved.getString("notificationOwnerInstance"));
+        assertEquals("server-change", saved.getString("changeEmailEvent"));
+        assertEquals("delivered-event", saved.getString("aftercareEmailSentAtEvent"));
+        assertEquals("current-event", saved.getJSONObject("notificationOutbox").getJSONObject("followUpEmailSentAt").getString("event"));
+        assertFalse(saved.containsKey("followUpEmailSentAt"));
+        assertFalse(saved.containsKey("reminderEmailSentAtPendingToken"));
+        assertEquals("new", saved.getString("notes"));
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(appointmentMapper);
+        order.verify(appointmentMapper).selectTcmAppointmentForUpdate(existing.getId());
+        order.verify(appointmentMapper).updateTcmAppointment(updated);
+        verify(appointmentMapper, never()).selectTcmAppointmentById(anyString());
+    }
+
+    @Test
+    void statusChangePreservesNotificationStateFromLockedCurrentRow()
+    {
+        TcmAppointment latest = appointment("latest-status", "p-2", "2026-03-28 09:00:00", "2026-03-28 09:30:00");
+        String payload = "{\"aftercareEmailSentAt\":\"2026-03-28 10:30:00\","
+                + "\"notificationOutbox\":{\"followUpEmailSentAt\":{\"event\":\"latest-event\"}},"
+                + "\"followUpEmailSentAtPendingToken\":\"current-claim\"}";
+        latest.setPayload(payload);
+        when(appointmentMapper.selectTcmAppointmentForUpdate(latest.getId())).thenReturn(latest);
+
+        TcmAppointment updated = service.updateStatus(latest.getId(), "confirmed");
+
+        assertEquals("confirmed", updated.getStatus());
+        assertEquals(payload, updated.getPayload());
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(appointmentMapper);
+        order.verify(appointmentMapper).selectTcmAppointmentForUpdate(latest.getId());
+        order.verify(appointmentMapper).updateTcmAppointment(latest);
+        verify(appointmentMapper, never()).selectTcmAppointmentById(anyString());
+    }
+
+    @Test
+    void updatingMissingAppointmentStopsBeforeSchedulingOrWriting()
+    {
+        TcmAppointment missing = appointment("missing", "p-2", "2026-03-28 09:00:00", "2026-03-28 09:30:00");
+        ServiceException error = assertThrows(ServiceException.class, () -> service.updateTcmAppointment(missing));
+        assertEquals("appointment not found", error.getMessage());
+        verify(appointmentMapper, never()).updateTcmAppointment(any());
+        org.mockito.Mockito.verifyNoInteractions(serviceTypeMapper, roomMapper, settingMapper, userMapper);
+    }
+
+    @Test
+    void completedIntakeConsumesOnlyTheCurrentTokenAndPreservesNotificationPayload()
+    {
+        TcmAppointment latest = appointment("intake", "p-2", "2026-03-28 09:00:00", "2026-03-28 09:30:00");
+        latest.setIntakeToken("current-token"); latest.setIntakeSubmitted(0);
+        latest.setPayload("{\"aftercareEmailSentAt\":\"delivered\"}");
+        when(appointmentMapper.selectTcmAppointmentForUpdate("intake")).thenReturn(latest);
+        when(appointmentMapper.updateNotificationIntake(any(), eq(latest))).thenReturn(1);
+        when(appointmentMapper.updateTcmAppointment(latest)).thenReturn(1);
+
+        TcmAppointment result = service.completeIntake("intake", "current-token", Map.of("chiefComplaint", "Pain"));
+
+        assertEquals(null, result.getIntakeToken());
+        assertEquals(1, result.getIntakeSubmitted());
+        JSONObject payload = JSONObject.parseObject(result.getPayload());
+        assertEquals("delivered", payload.getString("aftercareEmailSentAt"));
+        assertEquals("Pain", payload.getJSONObject("intakeFormData").getString("chiefComplaint"));
+        verify(appointmentMapper).updateNotificationIntake(argThat(row -> row.getIntakeToken() == null
+                && Integer.valueOf(1).equals(row.getIntakeSubmitted())), any());
+    }
+
+    @Test
+    void intakeSubmissionCannotConsumeARegeneratedToken()
+    {
+        TcmAppointment latest = appointment("intake", "p-2", "2026-03-28 09:00:00", "2026-03-28 09:30:00");
+        latest.setIntakeToken("new-token");
+        when(appointmentMapper.selectTcmAppointmentForUpdate("intake")).thenReturn(latest);
+        assertThrows(ServiceException.class, () -> service.completeIntake("intake", "old-token", Map.of("chiefComplaint", "Pain")));
+        verify(appointmentMapper, never()).updateNotificationIntake(any(), any());
+        verify(appointmentMapper, never()).updateTcmAppointment(any());
+    }
+
+    @Test
+    void newlyCreatedAppointmentCannotInjectNotificationQueueOrDeliveryMetadata()
+    {
+        TcmAppointment incoming = appointment("new", "p-2", "2026-03-28 09:00:00", "2026-03-28 09:30:00");
+        incoming.setServiceType("time_block");
+        incoming.setPayload("{\"notes\":\"Keep\",\"notificationOutbox\":{\"fake\":{}},\"aftercareEmailSentAtEvent\":\"forged\",\"manageToken\":\"forged\"}");
+        when(appointmentMapper.insertTcmAppointment(incoming)).thenReturn(1);
+        assertEquals(1, service.insertTcmAppointment(incoming));
+        JSONObject payload = JSONObject.parseObject(incoming.getPayload());
+        assertEquals("Keep", payload.getString("notes"));
+        assertFalse(payload.containsKey("notificationOutbox"));
+        assertFalse(payload.containsKey("aftercareEmailSentAtEvent"));
+        assertFalse(payload.containsKey("manageToken"));
     }
 
     @Test

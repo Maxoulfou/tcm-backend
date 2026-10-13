@@ -43,6 +43,9 @@ public interface ITcmAppointmentService
      */
     int updateTcmAppointment(TcmAppointment appointment);
 
+    /** Save an intake form and consume exactly the token presented by its submitter. */
+    TcmAppointment completeIntake(String id, String expectedToken, Map<String, Object> formData);
+
     /**
      * 更新预约状态
      *

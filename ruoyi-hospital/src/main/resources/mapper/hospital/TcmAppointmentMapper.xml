@@ -56,6 +56,11 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         where id = #{id}
     </select>
 
+    <select id="selectTcmAppointmentForUpdate" parameterType="String" resultMap="TcmAppointmentResult">
+        <include refid="selectTcmAppointmentVo"/>
+        where id = #{id} for update
+    </select>
+
     <select id="selectTcmAppointmentByIntakeToken" parameterType="String" resultMap="TcmAppointmentResult">
         <include refid="selectTcmAppointmentVo"/>
         where intake_token = #{intakeToken}
@@ -156,12 +161,41 @@ PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
             <if test="endTime != null">end_time = #{endTime},</if>
             <if test="status != null and status != ''">status = #{status},</if>
             <if test="branchId != null">branch_id = #{branchId},</if>
-            intake_token = #{intakeToken},
+            <if test="intakeToken != null">intake_token = #{intakeToken},</if>
             <if test="intakeSubmitted != null">intake_submitted = #{intakeSubmitted},</if>
             <if test="payload != null">payload = #{payload},</if>
             update_time = sysdate()
         </set>
         where id = #{id}
+    </update>
+
+    <sql id="notificationExpectedState">
+        id = #{expected.id}
+        AND (CAST(payload AS BINARY) = CAST(#{expected.payload} AS BINARY) OR (payload IS NULL AND #{expected.payload} IS NULL))
+        AND (status = #{expected.status} OR (status IS NULL AND #{expected.status} IS NULL))
+        AND (patient_id = #{expected.patientId} OR (patient_id IS NULL AND #{expected.patientId} IS NULL))
+        AND (start_time = #{expected.startTime} OR (start_time IS NULL AND #{expected.startTime} IS NULL))
+        AND (end_time = #{expected.endTime} OR (end_time IS NULL AND #{expected.endTime} IS NULL))
+        AND (practitioner_id = #{expected.practitionerId} OR (practitioner_id IS NULL AND #{expected.practitionerId} IS NULL))
+        AND (room_id = #{expected.roomId} OR (room_id IS NULL AND #{expected.roomId} IS NULL))
+        AND (service_type = #{expected.serviceType} OR (service_type IS NULL AND #{expected.serviceType} IS NULL))
+        AND (branch_id = #{expected.branchId} OR (branch_id IS NULL AND #{expected.branchId} IS NULL))
+        AND (intake_token = #{expected.intakeToken} OR (intake_token IS NULL AND #{expected.intakeToken} IS NULL))
+    </sql>
+
+    <update id="updateNotificationPayload">
+        UPDATE tcm_appointment SET payload = #{record.payload}, update_time = sysdate()
+        WHERE <include refid="notificationExpectedState"/>
+    </update>
+
+    <update id="updateNotificationIntake">
+        UPDATE tcm_appointment SET intake_token = #{record.intakeToken}, intake_submitted = #{record.intakeSubmitted}, update_time = sysdate()
+        WHERE <include refid="notificationExpectedState"/>
+    </update>
+
+    <update id="cancelNotificationAppointment">
+        UPDATE tcm_appointment SET status = 'cancelled', payload = #{record.payload}, update_time = sysdate()
+        WHERE <include refid="notificationExpectedState"/>
     </update>
 
     <delete id="deleteTcmAppointmentById" parameterType="String">

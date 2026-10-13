@@ -27,6 +27,9 @@ public interface TcmAppointmentMapper
      */
     TcmAppointment selectTcmAppointmentById(String id);
 
+    /** Read the current row while serializing appointment edits with notification writes. */
+    TcmAppointment selectTcmAppointmentForUpdate(String id);
+
     TcmAppointment selectTcmAppointmentByManageToken(String token);
 
     /**
@@ -44,6 +47,12 @@ public interface TcmAppointmentMapper
      * @return 结果
      */
     int updateTcmAppointment(TcmAppointment tcmAppointment);
+
+    int updateNotificationPayload(@Param("record") TcmAppointment record, @Param("expected") TcmAppointment expected);
+
+    int updateNotificationIntake(@Param("record") TcmAppointment record, @Param("expected") TcmAppointment expected);
+
+    int cancelNotificationAppointment(@Param("record") TcmAppointment record, @Param("expected") TcmAppointment expected);
 
     /**
      * 删除预约

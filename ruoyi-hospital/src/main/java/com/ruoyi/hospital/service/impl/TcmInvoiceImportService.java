@@ -158,12 +158,13 @@ public class TcmInvoiceImportService
             payload.put("purchasePrice", price);
             payload.put("lastInvoiceId", id);
             item.setPayload(payload.toJSONString());
-            if (create) inventoryService.insertTcmInventoryItem(item); else inventoryService.updateTcmInventoryItem(item);
+            int saved = create ? inventoryService.insertTcmInventoryItem(item) : inventoryService.updateTcmInventoryItem(item);
+            if (saved != 1) throw new ServiceException("Inventory could not be saved. No invoice lines were imported; please retry.");
         }
         preview.put("imported", true);
         preview.put("importedAt", System.currentTimeMillis());
         record.setSettingValue(preview.toJSONString());
-        settingMapper.updateSetting(record);
+        if (settingMapper.updateSetting(record) != 1) throw new ServiceException("Invoice import could not be recorded. No invoice lines were imported; please retry.");
         return JSONObject.of("imported", true, "invoiceId", id, "updatedCount", items.size());
     }
 

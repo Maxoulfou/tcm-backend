@@ -107,7 +107,7 @@ class TcmPrescriptionStockTest
     }
 
     @Test
-    void deletedExplicitStockCannotBeReplacedByAnotherSuppliersNamesake()
+    void archivedReservationReturnsToOriginalStockWithoutReactivatingOrUsingANamesake()
     {
         TcmInventoryItem deleted = new TcmInventoryItem();
         deleted.setId("deleted-stock"); deleted.setName("通草"); deleted.setCategory("raw_herbs");
@@ -115,17 +115,48 @@ class TcmPrescriptionStockTest
         deleted.setDeletedAt("2026-10-01 10:00:00"); deleted.setQuantity(new BigDecimal("40"));
         stock.setSupplierId("other-supplier");
         when(mapper.selectTcmInventoryItemById("deleted-stock")).thenReturn(deleted);
+        when(mapper.selectTcmInventoryItemForUpdate("deleted-stock")).thenReturn(deleted);
         when(mapper.selectTcmInventoryItemsByName("通草", "raw_herbs")).thenReturn(List.of(stock));
         Map<String, Object> reservation = new LinkedHashMap<>(line("5"));
         reservation.put("inventoryId", "deleted-stock");
         reservation.put("supplierId", "original-supplier");
 
-        assertEquals(false, service.restoreFromPrescription(List.of(reservation), "raw_herbs").get("success"));
+        assertEquals(true, service.restoreFromPrescription(List.of(reservation), "raw_herbs").get("success"));
         assertEquals(false, service.deductFromPrescription(List.of(reservation), "raw_herbs").get("success"));
         assertEquals(new BigDecimal("100"), stock.getQuantity());
-        assertEquals(new BigDecimal("40"), deleted.getQuantity());
-        verify(mapper, never()).updateTcmInventoryItem(any());
-        verifyNoInteractions(audit);
+        assertEquals(new BigDecimal("45"), deleted.getQuantity());
+        assertEquals(0, deleted.getIsActive());
+        assertEquals("2026-10-01 10:00:00", deleted.getDeletedAt());
+        verify(mapper).updateTcmInventoryItem(deleted);
+        verify(mapper, never()).selectTcmInventoryItemsByName(anyString(), anyString());
+        verify(audit).log(eq("inventory"), eq("deleted-stock"), eq("通草"),
+                eq("PRESCRIPTION_RESTORE"), anyString(), anyString());
+    }
+
+    @Test
+    void reservationCanReturnToInactiveStockButCannotDeductFromIt()
+    {
+        stock.setIsActive(0);
+        assertEquals(true, service.restoreFromPrescription(List.of(line("5")), "raw_herbs").get("success"));
+        assertEquals(new BigDecimal("105"), stock.getQuantity());
+        assertEquals(0, stock.getIsActive());
+        assertEquals(false, service.deductFromPrescription(List.of(line("5")), "raw_herbs").get("success"));
+        verify(mapper).updateTcmInventoryItem(stock);
+    }
+
+    @Test
+    void reservationReturnUsesArchivedStateFromLockedRow()
+    {
+        TcmInventoryItem current = new TcmInventoryItem();
+        current.setId("stock"); current.setName("通草"); current.setCategory("raw_herbs");
+        current.setIsActive(0); current.setDeletedAt("2026-10-13 10:00:00");
+        current.setQuantity(new BigDecimal("50"));
+        when(mapper.selectTcmInventoryItemForUpdate("stock")).thenReturn(current);
+
+        assertEquals(true, service.restoreFromPrescription(List.of(line("5")), "raw_herbs").get("success"));
+        assertEquals(new BigDecimal("55"), current.getQuantity());
+        assertEquals("2026-10-13 10:00:00", current.getDeletedAt());
+        verify(mapper).updateTcmInventoryItem(current);
     }
 
     @Test

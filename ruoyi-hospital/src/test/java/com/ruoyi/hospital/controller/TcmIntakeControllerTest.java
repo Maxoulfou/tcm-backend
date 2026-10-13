@@ -65,6 +65,21 @@ class TcmIntakeControllerTest
     }
 
     @Test
+    void appointmentIntakeUsesExplicitTokenConsumptionInsteadOfGenericAppointmentEdit()
+    {
+        TcmAppointment appointment = new TcmAppointment();
+        appointment.setId("appointment"); appointment.setPatientId("patient"); appointment.setIntakeSubmitted(0);
+        Map<String, Object> form = Map.of("chiefComplaint", "Pain");
+        when(appointmentService.selectTcmAppointmentByIntakeToken("token")).thenReturn(appointment);
+        when(appointmentService.completeIntake("appointment", "token", form)).thenReturn(appointment);
+
+        assertEquals(true, controller.submitIntakeForm("token", form).get("ok"));
+        verify(appointmentService).completeIntake("appointment", "token", form);
+        verify(patientService).saveLatestIntakeForm("patient", form);
+        verify(appointmentService, never()).updateTcmAppointment(any());
+    }
+
+    @Test
     void submitIntakeForm_shouldRejectMissingChiefComplaintBeforeSaving()
     {
         Map<String, Object> formData = new LinkedHashMap<>();

@@ -103,7 +103,9 @@ public class TcmAppointmentController {
         ensureAppointmentAccessible(existing);
         TcmAppointment appointment = PayloadUtils.toAppointment(body);
         appointment.setId(id);
-        appointment.setIntakeToken(existing.getIntakeToken());
+        // Ordinary edits cannot replace server-owned intake tokens or submission state.
+        appointment.setIntakeToken(null);
+        appointment.setIntakeSubmitted(null);
         if (appointment.getPatientId() != null && !appointment.getPatientId().trim().isEmpty()) {
             ensurePatientAccessible(appointment.getPatientId());
         }

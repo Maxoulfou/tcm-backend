@@ -208,7 +208,7 @@ public class TcmInventoryServiceImpl implements ITcmInventoryService
             if (quantity.signum() == 0) continue;
             String name = stringValue(herbal.get("name"));
             TcmInventoryItem item = resolveInventoryItem(stringValue(herbal.get("inventoryId")), name,
-                    category, stringValue(herbal.get("supplierId")));
+                    category, stringValue(herbal.get("supplierId")), restore);
             if (item == null)
             {
                 notFound.add(new HashMap<>(herbal));
@@ -231,8 +231,8 @@ public class TcmInventoryServiceImpl implements ITcmInventoryService
         for (String id : lockedItems.keySet())
         {
             TcmInventoryItem item = inventoryMapper.selectTcmInventoryItemForUpdate(id);
-            if (item == null || (item.getDeletedAt() != null && !item.getDeletedAt().isEmpty())
-                    || !Integer.valueOf(1).equals(item.getIsActive()))
+            if (item == null || (!restore && ((item.getDeletedAt() != null && !item.getDeletedAt().isEmpty())
+                    || !Integer.valueOf(1).equals(item.getIsActive()))))
             {
                 errors.add("inventory item is no longer available: " + id);
                 continue;
@@ -469,17 +469,19 @@ public class TcmInventoryServiceImpl implements ITcmInventoryService
         return readRequestedQuantity(usageItem);
     }
 
-    private TcmInventoryItem resolveInventoryItem(String inventoryId, String name, String category, String preferredSupplierId)
+    private TcmInventoryItem resolveInventoryItem(String inventoryId, String name, String category,
+            String preferredSupplierId, boolean restore)
     {
         if (inventoryId != null && !inventoryId.isEmpty() && !"null".equals(inventoryId))
         {
             TcmInventoryItem exact = inventoryMapper.selectTcmInventoryItemById(inventoryId);
             if (exact != null
                     && category.equals(exact.getCategory())
-                    && (exact.getDeletedAt() == null || exact.getDeletedAt().isEmpty())
-                    && exact.getIsActive() != null
-                    && exact.getIsActive() == 1)
+                    && (restore || ((exact.getDeletedAt() == null || exact.getDeletedAt().isEmpty())
+                            && Integer.valueOf(1).equals(exact.getIsActive()))))
             {
+                // Returning a recorded reservation must still work after this stock
+                // entry was archived. Preserve its archived state and original ID.
                 return exact;
             }
             // An explicit reservation belongs to this stock record, never a namesake.

@@ -32,6 +32,9 @@ class TcmInvoiceImportServiceTest {
         preview = new TcmClinicSetting(); preview.setSettingKey("inventoryInvoice:" + id);
         preview.setSettingValue(JSONObject.of("createdAt", System.currentTimeMillis()).toJSONString());
         when(settings.selectSettingForUpdate(preview.getSettingKey())).thenReturn(preview);
+        when(settings.updateSetting(any())).thenReturn(1);
+        when(inventory.insertTcmInventoryItem(any())).thenReturn(1);
+        when(inventory.updateTcmInventoryItem(any())).thenReturn(1);
     }
     @Test void confirmedInvoiceAddsStockAndSetsOriginalCostAndDoubleSellingPrice() {
         TcmHerbDict herb = new TcmHerbDict(); herb.setId("h1"); herb.setName("通草"); herb.setIsActive(1);
@@ -68,6 +71,7 @@ class TcmInvoiceImportServiceTest {
         persisted.setPayload(locked.getPayload());
         when(inventoryMapper.selectTcmInventoryItemForUpdate("i1")).thenReturn(locked);
         when(inventoryMapper.selectTcmInventoryItemById("i1")).thenReturn(persisted);
+        when(inventoryMapper.updateTcmInventoryItem(any())).thenReturn(1);
 
         service.confirm(Map.of("invoiceId", id, "currency", "CAD", "items", List.of(Map.of(
             "inventoryId", "i1", "herbDictId", "h1", "category", "powder", "unit", "bag", "quantity", 3, "purchasePrice", 2.5))));

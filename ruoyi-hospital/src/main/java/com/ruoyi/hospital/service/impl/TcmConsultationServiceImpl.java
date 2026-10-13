@@ -167,6 +167,7 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         JSONObject existingPayload = normalizeConsultationPayload(existing, parsePayload(existing.getPayload()));
         JSONObject payload = normalizeConsultationPayload(consultation, parsePayload(consultation.getPayload()));
         inheritPrescriptionInventoryState(payload, existingPayload);
+        ensureDispensedPrescriptionsUnchanged(existingPayload, payload);
         if (hasInventoryRelevantPrescriptionChange(existingPayload, payload))
         {
             restoreReservationsFromPayload(existingPayload);
@@ -245,6 +246,11 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
     {
         TcmAppointment appointment = resolveLinkedAppointment(consultation, payload);
         if (appointment == null || !isCompletablePatientAppointment(appointment))
+        {
+            return;
+        }
+        appointment = appointmentMapper.selectTcmAppointmentForUpdate(appointment.getId());
+        if (!matchesConsultationAppointment(consultation, appointment) || !isCompletablePatientAppointment(appointment))
         {
             return;
         }
@@ -1641,6 +1647,24 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
         return !buildPrescriptionInventorySignature(existingPayload).equals(buildPrescriptionInventorySignature(nextPayload));
     }
 
+    private void ensureDispensedPrescriptionsUnchanged(JSONObject stored, JSONObject incoming)
+    {
+        List<Map<String, Object>> previous = toMapList(stored.get("prescriptions"));
+        List<Map<String, Object>> next = toMapList(incoming.get("prescriptions"));
+        for (int i = 0; i < previous.size(); i++)
+        {
+            Map<String, Object> prescription = previous.get(i);
+            if (isPrescriptionDeleted(prescription)
+                    || !"dispensed".equals(resolvePrescriptionStatus(prescription, null))) continue;
+            int nextIndex = findPrescriptionIndex(next, getString(prescription, "id", ""));
+            if (nextIndex < 0 || !buildPrescriptionInventoryKey(stored, prescription, i)
+                    .equals(buildPrescriptionInventoryKey(incoming, next.get(nextIndex), nextIndex)))
+            {
+                throw new ServiceException("已发处方请先回退后再修改或删除");
+            }
+        }
+    }
+
     private String buildPrescriptionInventorySignature(JSONObject payload)
     {
         List<String> entries = new ArrayList<>();
@@ -1724,10 +1748,13 @@ public class TcmConsultationServiceImpl implements ITcmConsultationService
 
     private String buildReservationSnapshotKey(Map<String, Object> item)
     {
-        return safeStringValue(item.get("inventoryId"))
-                + "::" + safeStringValue(item.get("name"))
-                + "::" + safeStringValue(item.get("supplierId"))
-                + "::" + toBigDecimal(item.get("quantity")).stripTrailingZeros().toPlainString();
+        String inventoryId = safeStringValue(item.get("inventoryId"));
+        // An explicit stock ID is authoritative; refreshed display names or
+        // supplier labels must not turn a notes-only save into a stock movement.
+        String identity = StringUtils.isNotBlank(inventoryId)
+                ? "id::" + inventoryId
+                : "name::" + safeStringValue(item.get("name")) + "::" + safeStringValue(item.get("supplierId"));
+        return identity + "::" + toBigDecimal(item.get("quantity")).stripTrailingZeros().toPlainString();
     }
 
     private void restoreReservationsFromPayload(JSONObject payload)
