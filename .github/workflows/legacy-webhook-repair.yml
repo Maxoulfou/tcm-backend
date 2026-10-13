@@ -1,0 +1,122 @@
+name: Legacy Webhook Configuration (inspect by default)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Inspect, or apply one narrowly scoped diagnosed configuration fix
+        type: choice
+        required: true
+        default: inspect
+        options:
+          - inspect
+          - repair-stripe-events
+          - repair-webhook-routing
+      expected_nginx_sha256:
+        description: Required for routing repair; copy config_sha256 from an inspect report
+        type: string
+        required: false
+        default: ''
+      expected_redirect_sha256:
+        description: Required for routing repair; copy redirect_block_sha256 from an inspect report
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: legacy-integration-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  inspect-or-repair:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test parser, redaction and scoped repair offline
+        run: |
+          python3 -B ops/legacy_integration_diagnostics.py --self-test
+          python3 -B ops/legacy_webhook_repair.py --self-test
+      - name: Inspect or apply the selected clinic configuration repair
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          EXPECTED_NGINX_SHA256: ${{ inputs.expected_nginx_sha256 }}
+          EXPECTED_REDIRECT_SHA256: ${{ inputs.expected_redirect_sha256 }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$DEPLOY_HOST" == '43.166.154.98' ]] || { echo '::error::Legacy host differs from the fixed target.'; exit 1; }
+          [[ "$DEPLOY_USER" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ && -n "$DEPLOY_SSH_KEY" ]] || { echo '::error::Legacy SSH configuration is unavailable.'; exit 1; }
+          case "$MODE" in inspect|repair-stripe-events|repair-webhook-routing) ;; *) echo '::error::Invalid mode.'; exit 1;; esac
+          [[ -z "$EXPECTED_NGINX_SHA256" || "$EXPECTED_NGINX_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::Invalid expected SHA256.'; exit 1; }
+          [[ "$MODE" != 'repair-webhook-routing' || -n "$EXPECTED_NGINX_SHA256" ]] || { echo '::error::Routing repair requires an inspected SHA256.'; exit 1; }
+          [[ -z "$EXPECTED_REDIRECT_SHA256" || "$EXPECTED_REDIRECT_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::Invalid redirect block SHA256.'; exit 1; }
+          [[ "$MODE" != 'repair-webhook-routing' || -n "$EXPECTED_REDIRECT_SHA256" ]] || { echo '::error::Routing repair requires the inspected redirect block SHA256.'; exit 1; }
+          PORT="${DEPLOY_PORT:-22}"
+          [[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) || { echo '::error::Invalid SSH port.'; exit 1; }
+          mkdir -p "$RUNNER_TEMP/legacy-webhook"
+          printf '%s\n' "$DEPLOY_SSH_KEY" | tr -d '\r' > "$RUNNER_TEMP/legacy-webhook/key"
+          ssh-keyscan -T 15 -p "$PORT" '43.166.154.98' > "$RUNNER_TEMP/legacy-webhook/known_hosts" 2>/dev/null
+          test -s "$RUNNER_TEMP/legacy-webhook/known_hosts"
+          # Bundle reviewed repository code into stdin; no Python files are installed on the server.
+          python3 - <<'PY'
+          import base64, os, pathlib
+          lines = ['import base64, sys, types']
+          for name in ('legacy_integration_diagnostics', 'legacy_webhook_repair'):
+              encoded = base64.b64encode(pathlib.Path('ops', name + '.py').read_bytes()).decode()
+              lines += [f'module = types.ModuleType({name!r})', f'sys.modules[{name!r}] = module',
+                        f'exec(compile(base64.b64decode({encoded!r}), {name!r}, "exec"), module.__dict__)']
+          lines += ['sys.exit(sys.modules["legacy_webhook_repair"].main())']
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'legacy-webhook', 'payload.py').write_text('\n'.join(lines))
+          PY
+          REMOTE="python3 -B - --target 43.166.154.98 --mode $MODE"
+          if [[ -n "$EXPECTED_NGINX_SHA256" ]]; then REMOTE="$REMOTE --expected-nginx-sha256 $EXPECTED_NGINX_SHA256"; fi
+          if [[ -n "$EXPECTED_REDIRECT_SHA256" ]]; then REMOTE="$REMOTE --expected-redirect-sha256 $EXPECTED_REDIRECT_SHA256"; fi
+          set +e
+          ssh -p "$PORT" -i "$RUNNER_TEMP/legacy-webhook/key" \
+            -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o LogLevel=ERROR \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$RUNNER_TEMP/legacy-webhook/known_hosts" \
+            "$DEPLOY_USER@43.166.154.98" "$REMOTE" \
+            < "$RUNNER_TEMP/legacy-webhook/payload.py" \
+            > "$RUNNER_TEMP/legacy-webhook/report.json" 2> "$RUNNER_TEMP/legacy-webhook/ssh-error"
+          STATUS=$?
+          set -e
+          export REPAIR_EXIT_STATUS="$STATUS"
+          python3 - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path(os.environ['RUNNER_TEMP'], 'legacy-webhook', 'report.json')
+          try:
+              report = json.loads(path.read_text())
+              assert report.get('target') == '43.166.154.98' and report.get('mode') == os.environ['MODE']
+              assert report.get('read_only') == (os.environ['MODE'] == 'inspect')
+              valid = True
+          except Exception:
+              valid = False
+              report = {'ok': False, 'error_type': 'RemoteDiagnosticUnavailable', 'ssh_exit_status': int(os.environ['REPAIR_EXIT_STATUS'])}
+              path.write_text(json.dumps(report, indent=2))
+          print(json.dumps(report, indent=2))
+          if not valid:
+              raise SystemExit(2)
+          PY
+          exit "$STATUS"
+      - name: Store sanitized before and after report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-webhook-configuration
+          path: ${{ runner.temp }}/legacy-webhook/report.json
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Remove runner SSH material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/legacy-webhook/key" "$RUNNER_TEMP/legacy-webhook/known_hosts" "$RUNNER_TEMP/legacy-webhook/ssh-error"
