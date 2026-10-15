@@ -1,64 +1,84 @@
 # TCM Backend — édition Go
 
-Réimplémentation Go autonome du backend TCM basé sur le projet Java/Spring Boot situé dans le dépôt parent. Cette édition est isolée dans `golang-version/` et ne modifie pas l’application Java existante.
+Port Go modulaire du backend TCM/RuoYi du dépôt parent. Cette implémentation constitue une base de travail séparée : elle ne remplace pas encore toutes les fonctionnalités Spring Boot et ne doit pas être utilisée avec des données de santé réelles avant revue métier, sécurité et confidentialité.
 
-> **État du port :** il s’agit d’une première version fonctionnelle du cœur API, pas encore d’une parité 1:1 avec les 442 classes Java. Les flux ou intégrations explicitement indiqués « à compléter » ne sont pas présentés comme terminés.
+## Architecture
 
-## Prérequis et démarrage
+| Dossier | Responsabilité |
+| --- | --- |
+| `cmd/tcm-server` | Point d’entrée minimal : délègue au runtime. |
+| `runtime` | Configuration, ouverture MySQL, construction du serveur, timeouts et arrêt gracieux. |
+| `ruoyi-admin` | Assemblage du routeur et des modules. |
+| `ruoyi-common/database` | Store MySQL, validation d’identifiants SQL, introspection, opérations et transactions. |
+| `ruoyi-common/httpx` | Réponses JSON et erreurs localisées. |
+| `ruoyi-common/i18n` | Catalogue chinois simplifié / anglais sélectionné avec `Accept-Language`. |
+| `ruoyi-framework/security` | JWT HS256, middleware d’authentification, CORS allowlist, limites de taille, headers défensifs et rate limit de login. |
+| `ruoyi-generator` | Lecture des tables du schéma pour l’administration du générateur. |
+| `ruoyi-hospital` | Ressources métier TCM, CRUD générique et réservation publique. |
+| `ruoyi-quartz` | Consultation des jobs RuoYi et primitives de planification en mémoire. |
+| `System` | Authentification, profil, mots de passe et lecture des utilisateurs système. |
+| `tools/checkfunc` | Vérificateur AST : aucune fonction ou méthode ne dépasse 20 lignes, tests compris. |
 
-- Go 1.22+
-- MySQL 8+ avec le schéma TCM/RuoYi existant
+Les noms `ruoyi-*` suivent les noms canoniques des modules Java, en minuscules pour rester conformes aux conventions Go. Le dossier `System` conserve le nom demandé; son identifiant de package Go est `system`.
 
-Le serveur n’exécute pas de migrations automatiquement. Le script historique `../sql/tcm_all_in_one.sql` contient des `DROP TABLE`; ne le lancez pas sur une base contenant des données à conserver. Faites une sauvegarde et suivez la procédure de migration du projet source.
+## Démarrage
+
+Prérequis : Go 1.22+ et une base MySQL initialisée avec le schéma du projet.
 
 ```sh
 cd golang-version
+cp .env.example .env   # exporter les variables manuellement ou utiliser votre gestionnaire de secrets
 export DB_HOST=127.0.0.1 DB_PORT=3306 DB_USER=tcm DB_PASSWORD='…' DB_NAME=tcm
 export JWT_SECRET="$(openssl rand -hex 32)"
-go mod download
-go test ./...
-go run ./cmd/tcm-server
+export CORS_ORIGINS="http://localhost:5173"
+make quality
+make build
+make run
 ```
 
-Par défaut, le serveur écoute sur `:8080`; `GET /health` fonctionne même sans base. Les routes métier exigent une connexion MySQL. On peut fournir un DSN complet à la place des paramètres DB :
+Le serveur écoute sur `:8080` par défaut. `DB_DSN` peut remplacer `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASSWORD` et `DB_NAME`. Le démarrage vérifie la connexion MySQL avant d’écouter; `/health` est donc disponible une fois l’initialisation réussie. En production, `JWT_SECRET` doit être défini explicitement et faire au moins 32 octets.
 
-```sh
-DB_DSN='user:password@tcp(127.0.0.1:3306)/tcm?parseTime=true&charset=utf8mb4&loc=America%2FToronto' go run ./cmd/tcm-server
-```
+Le backend n’exécute pas de migration automatique. Le dump parent `../sql/tcm_all_in_one.sql` contient des `DROP TABLE` : ne le lancez pas sur une base avec des données à conserver. Utilisez une sauvegarde et la procédure de migration du projet source.
 
-En `APP_ENV=production`, `JWT_SECRET` est obligatoire. Une clé de développement de secours n’est utilisée qu’en local, avec avertissement. Configurez `CORS_ORIGIN`, `PUBLIC_APP_BASE_URL`, `PUBLIC_API_BASE_URL` et `STORAGE_DIR` selon le déploiement. Les téléversements sont limités à 8 MiB et stockés localement avec permissions restreintes.
+## Sécurité et conventions
 
-## Fonctionnalités portées
+- **JWT** : HS256 seulement, signature vérifiée en temps constant, issuer, `exp` et `nbf` contrôlés. Durée actuelle : 12 heures; jeton transmis via `Authorization: Bearer …`, sans cookie.
+- **CORS** : origines exactes via `CORS_ORIGINS`; aucun wildcard ni credentials-cookie. Toute origine non déclarée est refusée.
+- **XSS** : réponses via `encoding/json` (échappement HTML activé), API sans rendu HTML, CSP restrictive, `nosniff`, `frame-ancestors 'none'`. Les notes et champs cliniques ne sont pas altérés par une « désinfection » globale; l’encodage doit rester contextuel à l’affichage.
+- **Entrées** : requête limitée à 8 MiB; identifiants de table/colonne limités à `[A-Za-z0-9_]`; valeurs SQL passées en paramètres. Les routes de login ont une limite locale en mémoire de 8 tentatives par minute et par adresse IP.
+- **Serveur** : timeouts HTTP explicites, récupération de panic sans détail interne dans la réponse, arrêt gracieux sur SIGINT/SIGTERM.
+- **Rôles** : les handlers appliquent des contrôles simples selon les rôles reçus de `sys_user_role`. Ils ne remplacent pas encore les permissions complètes du système RuoYi, ni les restrictions de portée par patient/branche.
+- **Secrets** : ne jamais committer `.env`, mots de passe ou secrets; utiliser un compte MySQL à privilèges minimaux et TLS en production.
+
+Le middleware XSS ne modifie pas les données sauvegardées : le rendu sûr dépend aussi du frontend. Une validation CSP ou CORS ne remplace pas une revue OWASP complète.
+
+## i18n
+
+Le catalogue `ruoyi-common/i18n` fournit des clés stables plutôt que des textes d’erreur dispersés. `Accept-Language: zh-CN` (ou `zh`) sélectionne le chinois simplifié; les autres langues retombent sur l’anglais. Le catalogue contient aussi **124 messages chinois distincts** extraits des appels Java d’exception/réponse (`ServiceException`, `AjaxResult.error`, `R.fail`, `MessageUtils.message`, `setMessage`) avec leur traduction anglaise. `TranslateSource` permet de mapper un littéral source exact; les commentaires techniques ne sont pas traduits.
+
+Le générateur `python3 tools/i18n_catalog.py` ré-extrait ces messages, demande les traductions par petits lots, vérifie les placeholders et régénère `source_messages.go`. Les autres libellés UI, annotations, fragments contextuels ou textes non présents dans ces appels de réponse n’ont pas tous été migrés; ajouter une clé et ses deux textes avant d’introduire une nouvelle erreur visible.
+
+## Routes présentes dans cette tranche
 
 - `GET /health`
-- Auth : `POST /api/auth/login`, `GET /api/auth/me`, modification et réinitialisation du mot de passe ; jetons signés HS256, expiration, contrôle des rôles et comparaison BCrypt des mots de passe MySQL.
-- CRUD métier par table du schéma pour patients, rendez-vous, consultations, branches, formules, dictionnaire d’herbes, inventaire, méridiens, points d’acupuncture, fournisseurs, modèles, conversions d’unités, salles, tarifs, types de service, journaux d’e-mail et fichiers.
-- Actions principales : suppression logique lorsque la table a `deleted_at`, transitions de rendez-vous/consultation, fusion transactionnelle de patients, paiements stockés dans `payload`, ajustement de stock et historique.
-- Réservation publique : options, une disponibilité journalière simplifiée, validation de conflit pour un créneau, création de réservation.
-- Consentement public et formulaires d’anamnèse par jeton, avec signature, expiration et stockage dans `payload`. Le bouton d’envoi ne transmet pas de courriel sans SMTP : la réponse signale clairement `sent: false`.
-- Pièces jointes : upload, liste par patient/consultation, téléchargement ZIP, suppression et URL d’accès signées à expiration.
-- Paramètres de clinique et aperçu statistique.
+- `POST /api/auth/login`, `GET /api/auth/me`, `POST /api/auth/change-password`, `POST /api/auth/reset-password`
+- `GET /api/users` (admin) et `GET /api/generator/tables` (admin)
+- `GET /api/monitor/job` (admin; lecture de `sys_job`)
+- CRUD de base pour patients, rendez-vous, consultations, branches, formules, dictionnaire d’herbes, inventaire, méridiens, points d’acupuncture, fournisseurs, modèles, conversions, salles, tarifs, types de service, journaux e-mail et fichiers.
+- Réservation publique : `GET /api/public-booking/options`, `GET /api/public-booking/availability?date=YYYY-MM-DD&serviceType=…`, `GET /api/public-booking/schedule?...` et `POST /api/public-booking`.
+- `POST /api/appointments/check-slot` pour vérifier un créneau; l’écriture publique est transactionnelle et sérialise les créations par type de service.
 
-Les colonnes SQL sont découvertes dans `information_schema`; les identifiants SQL dynamiques sont validés. Les champs additionnels des ressources qui ont une colonne `payload` y sont encodés en JSON. Les appels protégés attendent `Authorization: Bearer <token>`.
+Le CRUD générique ne constitue pas une implémentation complète des règles cliniques. Les API métier spécialisées, les schémas exacts et la compatibilité frontend doivent être validés avant usage.
 
-## Parité restant à réaliser
+## À implémenter pour la parité
 
-- Règles exactes de confidentialité par rôle, affectation des patients, audit complet, validations de domaine, verrouillage/versioning des consultations et synchronisation complète des prescriptions/stock.
-- Réservation publique de parité complète (horaires par praticien, règles par salle et service, fuseau et fenêtres de réservation, chevauchements complexes, libération progressive des créneaux, gestion/cancellation du jeton).
-- Envoi d’e-mails et notifications, modèles de courriel, PDFs de consultation/facture et stockage S3/R2 signé; le port actuel ne remplace que le stockage local des pièces jointes.
-- Stripe (checkout, terminal, webhooks), reconnaissance/import de factures et assistant IA : nécessitent des services externes/configuration.
-- Import/export bootstrap, CRUD complet d’administration RuoYi (utilisateurs/rôles/menus/configuration/jobs), diagnostics et outils opérationnels.
-- Quelques routes secondaires TCM (suppression/restauration de prescription, consultation par versions, liens manage, exports) restent à implémenter.
+Les liens et signatures de consentement/anamnèse, fichiers téléversés et URL signées, fusion de patients, paiements/inventaire spécialisés, règles complètes d’agenda par praticien/salle, audit et versionnage des consultations, emails, Stripe, exports, statistiques, CRUD complet des rôles/menus/configuration et exécution persistante des jobs Quartz ne sont pas encore portés dans cette structure. Quartz expose pour l’instant la lecture des jobs et un scheduler en mémoire, pas l’exécution du moteur cron RuoYi.
 
-Avant d’utiliser cette édition avec des données réelles de santé, achevez ces écarts, ajoutez des tests d’intégration MySQL et validez la compatibilité avec le frontend `tcm-app`, puis réalisez une revue sécurité/confidentialité. Les réponses `501` ne doivent pas être contournées par le frontend.
+Les autres textes interactifs Java chinois, les contrôles d’accès précis par patient et branche, les validations de domaine et les tests d’intégration MySQL restent des étapes requises. La version Go doit passer une revue de sécurité et de confidentialité avant toute exposition publique.
 
-## Tests et build
+## Qualité
 
 ```sh
-gofmt -w cmd/tcm-server
-go test ./...
-go vet ./...
-go build -o bin/tcm-server ./cmd/tcm-server
+make quality       # go test -race, go vet, contrôle AST des 20 lignes
+make build         # binaire autonome dans bin/tcm-server
 ```
-
-Les tests actuels couvrent JWT, liens d’accès signés, mapping des clés, compatibilité de rôles et `/health`. Aucun serveur MySQL de test n’est fourni.

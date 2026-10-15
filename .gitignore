@@ -49,6 +49,8 @@ nbdist/
 *.swp
 .vscode/
 runtime/
+!golang-version/runtime/
+!golang-version/runtime/**
 ruoyi-admin/runtime/
 
 !*/build/*.java
